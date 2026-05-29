@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  用途: 每个工作日 18:00（本机时区）增量同步券商持仓邮件并构建产品报表。
+  使用:
+    1. 把仓库放到 /Users/admin/fundadmin/FundAdministration（路径不同请改下方所有 /Users/admin 段）。
+    2. 在仓库根创建 .venv 并 pip install -e .，填好 .env（IMAP_* / SMTP_* / FUND_DB_URL）。
+    3. cp deploy/launchd/com.fundadmin.portfolio-sync.plist ~/Library/LaunchAgents/
+    4. launchctl load ~/Library/LaunchAgents/com.fundadmin.portfolio-sync.plist
+    5. launchctl start com.fundadmin.portfolio-sync   # 立即触发一次
+    6. tail -f /Users/admin/fundadmin/logs/portfolio-sync.err.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fundadmin.portfolio-sync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/admin/fundadmin/FundAdministration/scripts/run_portfolio_sync.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/admin/fundadmin/FundAdministration</string>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/Users/admin/fundadmin/logs/portfolio-sync.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/admin/fundadmin/logs/portfolio-sync.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

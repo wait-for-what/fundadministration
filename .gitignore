@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+data/
+outputs/
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+研报素材CTA/

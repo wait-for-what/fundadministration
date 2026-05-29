@@ -1,0 +1,18 @@
+# 用途: 通过 Cloudflare Tunnel 把内网看板（Streamlit）暴露给指定域名。
+# 使用:
+#   1. cloudflared tunnel login
+#   2. cloudflared tunnel create fundadmin-dashboard   # 记下 tunnel UUID
+#   3. 复制本文件为 ~/.cloudflared/config.yml，替换 <TUNNEL_UUID> 与域名
+#   4. cloudflared tunnel route dns fundadmin-dashboard fund.example.com
+#   5. cloudflared tunnel run fundadmin-dashboard
+#
+# 边界: 看板含投资人 PII，务必在 Cloudflare Access 后加鉴权（Zero Trust 策略），
+#       不要直接公开暴露。
+
+tunnel: <TUNNEL_UUID>
+credentials-file: /Users/admin/.cloudflared/<TUNNEL_UUID>.json
+
+ingress:
+  - hostname: fund.example.com
+    service: http://localhost:8520
+  - service: http_status:404

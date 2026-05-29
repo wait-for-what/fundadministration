@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  用途: 开机自启 FundAdministration 内网看板 Streamlit（产品持仓 / 客户净值）。
+  使用:
+    1. 仓库放到 /Users/admin/fundadmin/FundAdministration（路径不同请改下方所有 /Users/admin 段）。
+    2. cp deploy/launchd/com.fundadmin.streamlit.plist ~/Library/LaunchAgents/
+    3. launchctl load ~/Library/LaunchAgents/com.fundadmin.streamlit.plist
+    4. tail -f /Users/admin/fundadmin/logs/streamlit.err.log
+  端口: 默认 8520，可在 run_streamlit.sh 通过 FUND_DASHBOARD_PORT 调整。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fundadmin.streamlit</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/admin/fundadmin/FundAdministration/scripts/run_streamlit.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>WorkingDirectory</key>
+    <string>/Users/admin/fundadmin/FundAdministration</string>
+    <key>StandardOutPath</key>
+    <string>/Users/admin/fundadmin/logs/streamlit.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/admin/fundadmin/logs/streamlit.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
