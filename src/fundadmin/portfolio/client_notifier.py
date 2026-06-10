@@ -164,7 +164,7 @@ td {{ padding: 8px 12px; border: 1px solid #ddd; }}
 <div class="footer">
 <p>注：持仓市值 = 持有份额 × 单位净值，仅供参考，实际以托管估值为准。</p>
 <p style="margin-top:8px;">如您对净值、持有份额等信息有任何疑问，可直接回复本邮件或致电联系我们。</p>
-<p style="margin-top:12px;">本邮件由 MarketAnalysis 自动生成。</p>
+<p style="margin-top:12px;">本邮件由弘运盛泰自动生成。</p>
 </div>
 </body>
 </html>"""
