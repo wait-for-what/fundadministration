@@ -1286,6 +1286,162 @@ def _run_email_sync_for_trade_date(
     )
 
 
+def _infer_broker_from_name(name: str) -> str:
+    """从附件文件名 best-effort 推断券商。"""
+    low = name.lower()
+    if "statement" in low or "履约保障" in name or "citic" in low or "中信" in name:
+        return "citic"
+    if "cicc" in low or "中金" in name:
+        return "cicc"
+    if "swhysc" in low or "申万" in name or "宏源" in name:
+        return "swhysc"
+    return "unknown"
+
+
+def _infer_product_code_from_name(name: str) -> str | None:
+    """从附件文件名 best-effort 反查产品代码（命中 cicc/citic 账户号即返回）。"""
+    from fundadmin.clients.config import NAME_TO_PRODCODE
+
+    low = name.lower()
+    for cfg in PRODUCT_CONFIG:
+        cicc = [str(t) for t in (cfg.get("cicc_codes") or [])]
+        citic = [str(t) for t in (cfg.get("citic_codes") or [])]
+        prodcode = cicc[0] if cicc else NAME_TO_PRODCODE.get(cfg.get("name", ""))
+        for tok in cicc + citic:
+            if tok and tok.lower() in low:
+                return prodcode
+    return None
+
+
+def _persist_attachments_raw(
+    files: list[Path],
+    *,
+    effective_trade_date: date,
+    inbox_dir: Path,
+) -> None:
+    """原始无损落地层：每个附件按内容 sha256 去重，逐 sheet 逐行存 JSON。
+
+    入库失败仅告警，不影响报表/邮件主流程。
+    """
+    from fundadmin.clients.schema import init_db
+    from fundadmin.clients.store import insert_attachment, upsert_raw_sheet_rows
+    from fundadmin.portfolio.parsers.common import read_csv_robust
+
+    try:
+        init_db()
+    except Exception:
+        logger.exception("raw-layer: init_db failed; skip ingest")
+        return
+
+    ingested = 0
+    skipped = 0
+    for path in files:
+        try:
+            data = path.read_bytes()
+            sha = hashlib.sha256(data).hexdigest()
+            suffix = path.suffix.lower()
+
+            sheets: list[tuple[str, pd.DataFrame]] = []
+            if suffix in (".xlsx", ".xls"):
+                book = pd.read_excel(path, sheet_name=None, header=None, dtype=object)
+                sheets = list(book.items())
+            elif suffix == ".csv":
+                sheets = [("csv", read_csv_robust(path))]
+
+            total_rows = sum(len(df) for _, df in sheets)
+            meta = {
+                "sha256": sha,
+                "file_name": path.name,
+                "file_suffix": suffix,
+                "broker": _infer_broker_from_name(path.name),
+                "product_code": _infer_product_code_from_name(path.name),
+                "as_of_date": effective_trade_date.isoformat(),
+                "attachment_type": _infer_attachment_kind(path),
+                "sheet_count": len(sheets),
+                "row_count": int(total_rows),
+                "inbox_dir": str(inbox_dir),
+            }
+            ingest_id, is_new = insert_attachment(meta)
+            if not is_new:
+                skipped += 1
+                continue
+
+            rows: list[dict[str, Any]] = []
+            for s_idx, (s_name, df) in enumerate(sheets):
+                for r_idx, (_, row) in enumerate(df.iterrows()):
+                    cells = [None if pd.isna(v) else v for v in row.tolist()]
+                    rows.append(
+                        {
+                            "ingest_id": ingest_id,
+                            "sheet_index": s_idx,
+                            "sheet_name": str(s_name),
+                            "row_index": r_idx,
+                            "cells_json": json.dumps(cells, ensure_ascii=False, default=str),
+                        }
+                    )
+            if rows:
+                upsert_raw_sheet_rows(pd.DataFrame(rows))
+            ingested += 1
+        except Exception:
+            logger.exception("raw-layer ingest failed for %s", path)
+
+    print(f"[OK] raw-layer ingest: {ingested} new attachment(s), {skipped} duplicate(s) skipped")
+
+
+def _persist_curated_layer(
+    results: list[dict[str, Any]],
+    *,
+    effective_trade_date: date,
+) -> None:
+    """核心结构层：写 product_valuation + fund_positions。入库失败仅告警。"""
+    from fundadmin.clients.config import NAME_TO_PRODCODE
+    from fundadmin.clients.store import upsert_positions, upsert_product_valuation
+
+    as_of = effective_trade_date.isoformat()
+    val_rows: list[dict[str, Any]] = []
+    pos_frames: list[pd.DataFrame] = []
+
+    for r in results:
+        pname = r.get("product_name", "")
+        pcode = NAME_TO_PRODCODE.get(pname)
+        if not pcode:
+            # 未在映射中的产品（如 沐泽1号 SQJ420）暂不入结构层；原始层已无损保留。
+            logger.warning("curated-layer: no product_code for %s, skipped structured tables", pname)
+            continue
+
+        val_rows.append(
+            {
+                "as_of_date": as_of,
+                "product_code": pcode,
+                "product_name": pname,
+                "unit_nav": r.get("unit_nav"),
+                "asset_nav": r.get("asset_nav"),
+                "nav_for_weight": r.get("nav"),
+                "total_holdings": r.get("total_holdings"),
+                "total_market_value_cny": r.get("total_market_value_cny"),
+                "ingest_id": None,
+            }
+        )
+
+        holdings_raw = r.get("holdings_raw")
+        if holdings_raw is not None and not holdings_raw.empty:
+            h = holdings_raw.copy()
+            h["as_of_date"] = as_of
+            h["product_code"] = pcode
+            h["product_name"] = pname
+            h = h.rename(columns={"company": "instrument_name", "shares": "quantity"})
+            pos_frames.append(h)
+
+    try:
+        n_val = upsert_product_valuation(pd.DataFrame(val_rows)) if val_rows else 0
+        n_pos = (
+            upsert_positions(pd.concat(pos_frames, ignore_index=True)) if pos_frames else 0
+        )
+        print(f"[OK] curated-layer: {n_val} valuation row(s), {n_pos} position row(s)")
+    except Exception:
+        logger.exception("curated-layer persistence failed")
+
+
 def _build_product_reports_for_trade_date(
     *,
     trade_date: date,
@@ -1311,6 +1467,14 @@ def _build_product_reports_for_trade_date(
     if warning:
         print(f"[WARN] {warning}")
 
+    # 原始无损落地层：把本次 inbox 的所有附件按 sha256 去重入库（失败仅告警）。
+    if files:
+        _persist_attachments_raw(
+            files,
+            effective_trade_date=effective_trade_date,
+            inbox_dir=resolved_inbox,
+        )
+
     resolved_report_root = Path(report_root) if report_root is not None else _default_report_root()
     resolved_out_dir = Path(out_dir) if out_dir is not None else (
         resolved_report_root / effective_trade_date.isoformat()
@@ -1328,6 +1492,9 @@ def _build_product_reports_for_trade_date(
     print(f"[OK] {len(results)} product reports built into: {resolved_out_dir}")
     for result in results:
         print(f"  {result['product_name']}: {result['out_xlsx']}")
+
+    # 核心结构层：从 build 结果写 product_valuation + fund_positions（失败仅告警）。
+    _persist_curated_layer(results, effective_trade_date=effective_trade_date)
 
     chart_paths: dict[str, Path] = {}
     if with_charts:

@@ -30,6 +30,9 @@ PRODCODE_TO_NAME: Mapping[str, str] = {
     "SXQ602": "铂金8号",
 }
 
+# 名称 -> 产品代码（PRODCODE_TO_NAME 的反查；供 product_name -> product_code 入库映射）
+NAME_TO_PRODCODE: Mapping[str, str] = {name: code for code, name in PRODCODE_TO_NAME.items()}
+
 
 def resolve_db_url() -> str:
     """读取 FUND_DB_URL；缺失时报错。
