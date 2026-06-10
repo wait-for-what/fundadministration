@@ -1450,6 +1450,7 @@ def _build_product_reports_for_trade_date(
     out_dir: Path | None = None,
     with_charts: bool = False,
     with_email: bool = False,
+    notify_clients: bool = False,
     email_to: str = "",
     smtp_host: str = "",
     smtp_port: int = 0,
@@ -1550,7 +1551,11 @@ def _build_product_reports_for_trade_date(
 
     email_sent = False
     email_skip_reason = ""
-    if with_email:
+    client_notify_sent = 0
+    client_notify_skip_reason = ""
+    # 两封邮件（内部持仓汇总 + 客户净值通知）共用同一完整性门槛：
+    # 仅当成功构建且数据完整（_product_email_completion_issues 为空）时才发送。
+    if with_email or notify_clients:
         completion_issues = _product_email_completion_issues(
             results=results,
             summary_path=summary_path,
@@ -1558,52 +1563,89 @@ def _build_product_reports_for_trade_date(
             chart_paths=chart_paths,
         )
         if completion_issues:
-            email_skip_reason = "; ".join(completion_issues)
-            print(f"[WARN] matrix email skipped: {email_skip_reason}")
+            reason = "; ".join(completion_issues)
+            if with_email:
+                email_skip_reason = reason
+                print(f"[WARN] matrix email skipped: {reason}")
+            if notify_clients:
+                client_notify_skip_reason = reason
+                print(f"[WARN] client NAV notify skipped: {reason}")
         else:
             load_env()
-            to_addrs = [x.strip() for x in str(email_to or "").split(",") if x.strip()]
-            if not to_addrs:
-                env_to = get_env("EMAIL_TO", default="")
-                to_addrs = [x.strip() for x in str(env_to).split(",") if x.strip()]
-            if not to_addrs:
-                raise RuntimeError("--with-email requires --email-to or EMAIL_TO")
 
-            resolved_smtp_host = str(smtp_host or get_env("SMTP_HOST", required=True) or "")
-            resolved_smtp_port = int(smtp_port or int(get_env("SMTP_PORT", "465") or "465"))
-            resolved_smtp_user = str(smtp_user or get_env("SMTP_USER", required=True) or "")
-            resolved_smtp_pass = str(smtp_pass or get_env("SMTP_PASS", required=True) or "")
-            resolved_smtp_from = str(
-                smtp_from or get_env("EMAIL_FROM", default="") or resolved_smtp_user
-            )
+            # ---- 内部持仓汇总邮件（EMAIL_TO，QQ 邮箱 SMTP）----
+            if with_email:
+                to_addrs = [x.strip() for x in str(email_to or "").split(",") if x.strip()]
+                if not to_addrs:
+                    env_to = get_env("EMAIL_TO", default="")
+                    to_addrs = [x.strip() for x in str(env_to).split(",") if x.strip()]
+                if not to_addrs:
+                    raise RuntimeError("--with-email requires --email-to or EMAIL_TO")
 
-            if not resolved_smtp_host or not resolved_smtp_user or not resolved_smtp_pass:
-                raise RuntimeError("SMTP config incomplete: require SMTP_HOST, SMTP_USER, SMTP_PASS")
+                resolved_smtp_host = str(smtp_host or get_env("SMTP_HOST", required=True) or "")
+                resolved_smtp_port = int(smtp_port or int(get_env("SMTP_PORT", "465") or "465"))
+                resolved_smtp_user = str(smtp_user or get_env("SMTP_USER", required=True) or "")
+                resolved_smtp_pass = str(smtp_pass or get_env("SMTP_PASS", required=True) or "")
+                resolved_smtp_from = str(
+                    smtp_from or get_env("EMAIL_FROM", default="") or resolved_smtp_user
+                )
 
-            smtp = SmtpConfig(
-                host=resolved_smtp_host,
-                port=resolved_smtp_port,
-                user=resolved_smtp_user,
-                password=resolved_smtp_pass,
-                from_addr=resolved_smtp_from,
-            )
+                if not resolved_smtp_host or not resolved_smtp_user or not resolved_smtp_pass:
+                    raise RuntimeError("SMTP config incomplete: require SMTP_HOST, SMTP_USER, SMTP_PASS")
 
-            attachments: dict[str, bytes] = {}
-            if summary_path is not None and summary_path.exists():
-                attachments[summary_path.name] = summary_path.read_bytes()
+                smtp = SmtpConfig(
+                    host=resolved_smtp_host,
+                    port=resolved_smtp_port,
+                    user=resolved_smtp_user,
+                    password=resolved_smtp_pass,
+                    from_addr=resolved_smtp_from,
+                )
 
-            send_matrix_email(
-                results,
-                trade_date=effective_trade_date,
-                chart_paths=chart_paths,
-                smtp_config=smtp,
-                to_addrs=to_addrs,
-                attachments=attachments if attachments else None,
-            )
-            excluded = {"沐泽1号"}
-            sent_count = sum(1 for result in results if result.get("product_name", "") not in excluded)
-            email_sent = True
-            print(f"[OK] matrix email ({sent_count} products) sent to: {', '.join(to_addrs)}")
+                attachments: dict[str, bytes] = {}
+                if summary_path is not None and summary_path.exists():
+                    attachments[summary_path.name] = summary_path.read_bytes()
+
+                send_matrix_email(
+                    results,
+                    trade_date=effective_trade_date,
+                    chart_paths=chart_paths,
+                    smtp_config=smtp,
+                    to_addrs=to_addrs,
+                    attachments=attachments if attachments else None,
+                )
+                excluded = {"沐泽1号"}
+                sent_count = sum(1 for result in results if result.get("product_name", "") not in excluded)
+                email_sent = True
+                print(f"[OK] matrix email ({sent_count} products) sent to: {', '.join(to_addrs)}")
+
+            # ---- 客户净值通知（clients 表，企业邮箱 SMTP xuekun@hysttz.com）----
+            if notify_clients:
+                nc_user = str(get_env("IMAP_USER", default="") or "")
+                nc_pass = str(get_env("IMAP_PASS", default="") or "")
+                if not nc_user or not nc_pass:
+                    client_notify_skip_reason = "SMTP config incomplete (need IMAP_USER/IMAP_PASS)"
+                    print(f"[WARN] client NAV notify skipped: {client_notify_skip_reason}")
+                elif summary_path is None or not summary_path.exists():
+                    client_notify_skip_reason = "summary excel missing"
+                    print(f"[WARN] client NAV notify skipped: {client_notify_skip_reason}")
+                else:
+                    nc_smtp = SmtpConfig(
+                        host="smtp.exmail.qq.com",
+                        port=465,
+                        user=nc_user,
+                        password=nc_pass,
+                        from_addr=nc_user,
+                    )
+                    stats = send_client_nav_emails(
+                        trade_date=effective_trade_date,
+                        summary_xlsx=summary_path,
+                        smtp_config=nc_smtp,
+                    )
+                    client_notify_sent = int(stats.get("sent", 0))
+                    print(
+                        f"[OK] client NAV notify: {stats['sent']} sent, "
+                        f"{stats['skipped']} skipped, {stats.get('total', 0)} total"
+                    )
 
     payload = {
         "trade_date": effective_trade_date.isoformat(),
@@ -1616,6 +1658,9 @@ def _build_product_reports_for_trade_date(
     if with_email:
         payload["email_sent"] = email_sent
         payload["email_skip_reason"] = email_skip_reason
+    if notify_clients:
+        payload["client_notify_sent"] = client_notify_sent
+        payload["client_notify_skip_reason"] = client_notify_skip_reason
     return payload
 
 
@@ -1765,6 +1810,9 @@ def _cmd_sync_latest(args: argparse.Namespace) -> int:
                     trade_date=trade_date,
                     inbox_dir=out_dir,
                     report_root=report_root,
+                    with_email=bool(getattr(args, "with_email", False)),
+                    notify_clients=bool(getattr(args, "notify_clients", False)),
+                    email_to=str(getattr(args, "email_to", "") or ""),
                 )
                 built_reports += 1
                 print(
@@ -1824,6 +1872,7 @@ def _cmd_build_products(args: argparse.Namespace) -> int:
             out_dir=Path(args.out_dir) if str(args.out_dir or "").strip() else None,
             with_charts=bool(args.with_charts),
             with_email=bool(args.with_email),
+            notify_clients=bool(getattr(args, "notify_clients", False)),
             email_to=str(args.email_to or ""),
             smtp_host=str(args.smtp_host or ""),
             smtp_port=int(args.smtp_port or 0),
@@ -1924,6 +1973,9 @@ def main(argv: list[str] | None = None) -> int:
     parser_sync.add_argument("--product-scope", action=argparse.BooleanOptionalAction, default=True, help="Only sync configured fund-product emails and attachments.")
     parser_sync.add_argument("--scope-from-products", action=argparse.BooleanOptionalAction, default=True, help="Push PRODUCT_CONFIG codes into IMAP server-side SUBJECT SEARCH to reduce traffic. Default on.")
     parser_sync.add_argument("--skip-processed", action=argparse.BooleanOptionalAction, default=True, help="Skip messages already recorded in the processed-mail state file.")
+    parser_sync.add_argument("--with-email", action="store_true", default=False, help="Send internal matrix summary email after each successful, data-complete build.")
+    parser_sync.add_argument("--notify-clients", action="store_true", default=False, help="Send client NAV notification emails after each successful, data-complete build.")
+    parser_sync.add_argument("--email-to", default="", help="Comma-separated matrix-email recipients (or set EMAIL_TO env var).")
     parser_sync.set_defaults(func=_cmd_sync_latest)
 
     parser_build = sub.add_parser("build", help="Compatibility alias of build-products. Prefer build-products.")
@@ -1959,6 +2011,7 @@ def main(argv: list[str] | None = None) -> int:
     parser_bp.add_argument("--out-dir", default="", help="Output directory for product reports.")
     parser_bp.add_argument("--with-charts", action="store_true", default=False, help="Generate holdings pie charts for each product.")
     parser_bp.add_argument("--with-email", action="store_true", default=False, help="Send summary email after build.")
+    parser_bp.add_argument("--notify-clients", action="store_true", default=False, help="Send client NAV notification emails after a successful, data-complete build.")
     parser_bp.add_argument("--email-to", default="", help="Comma-separated recipient addresses (or set EMAIL_TO env var).")
     parser_bp.add_argument("--smtp-host", default="", help="Override SMTP_HOST.")
     parser_bp.add_argument("--smtp-port", default=0, type=int, help="Override SMTP_PORT.")
