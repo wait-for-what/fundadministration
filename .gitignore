@@ -5,6 +5,7 @@ venv/
 .env
 data/
 outputs/
+logs/
 *.db
 *.sqlite
 *.sqlite3

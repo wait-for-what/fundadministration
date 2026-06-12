@@ -38,6 +38,7 @@ import imaplib
 import json
 import logging
 import re
+import shutil
 import ssl
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -78,7 +79,11 @@ from fundadmin.notifications.email import SmtpConfig
 logger = logging.getLogger(__name__)
 
 DEFAULT_SYNC_LOOKBACK = 1
+# 发布段回看天数：券商报告 T+1/T+2 才到邮箱，需扫描近若干天收件目录，
+# 按文件名里的交易日重新分组，确保较旧但补齐的交易日也能被发出。
+PUBLISH_SCAN_DAYS = 10
 DEFAULT_STATE_FILENAME = "email_sync_state.json"
+PUBLISH_STATE_FILENAME = "published_state.json"
 SUPPORTED_ATTACHMENT_SUFFIXES = (".xlsx", ".xlsm", ".xls", ".csv")
 FILENAME_ISO_DATE_PATTERN = re.compile(r"(?<!\d)(20\d{2}-\d{2}-\d{2})(?!\d)")
 FILENAME_COMPACT_DATE_PATTERN = re.compile(r"(?<!\d)(20\d{6})(?!\d)")
@@ -187,6 +192,11 @@ def _default_mail_state_path(inbox_root: Path | None = None) -> Path:
     return root / "_state" / DEFAULT_STATE_FILENAME
 
 
+def _default_publish_state_path(inbox_root: Path | None = None) -> Path:
+    root = Path(inbox_root) if inbox_root is not None else _default_inbox_root()
+    return root / "_state" / PUBLISH_STATE_FILENAME
+
+
 def _extract_trade_dates_from_text(text: str) -> list[date]:
     resolved: set[date] = set()
     raw = str(text or "")
@@ -290,6 +300,41 @@ def _load_email_sync_state(path: Path) -> dict[str, Any]:
 def _save_email_sync_state(path: Path, state: dict[str, Any]) -> None:
     _ensure_dir(path.parent)
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_publish_state(path: Path) -> dict[str, Any]:
+    """发布记录：trade_date -> {"matrix_sent_at": iso, "clients_sent_at": iso}。
+
+    用于 sync-latest 发布段去重：同一交易日某渠道已成功发送后不再重发，
+    数据不齐的交易日不会写入记录，留待后续补料后自动补发。
+    """
+    if not path.exists():
+        return {"version": 1, "published": {}}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"invalid publish state payload: {path}")
+    if not isinstance(raw.get("published"), dict):
+        raw["published"] = {}
+    raw["version"] = int(raw.get("version") or 1)
+    return raw
+
+
+def _save_publish_state(path: Path, state: dict[str, Any]) -> None:
+    _ensure_dir(path.parent)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _publish_channel_done(state: dict[str, Any], trade_date: date, channel: str) -> bool:
+    entry = state.get("published", {}).get(trade_date.isoformat())
+    if not isinstance(entry, dict):
+        return False
+    return bool(entry.get(f"{channel}_sent_at"))
+
+
+def _mark_publish_channel(state: dict[str, Any], trade_date: date, channel: str) -> None:
+    published = state.setdefault("published", {})
+    entry = published.setdefault(trade_date.isoformat(), {})
+    entry[f"{channel}_sent_at"] = datetime.now().isoformat(timespec="seconds")
 
 
 def _message_key_from_header(msg: Message, header_bytes: bytes) -> str:
@@ -1442,6 +1487,97 @@ def _persist_curated_layer(
         logger.exception("curated-layer persistence failed")
 
 
+def _build_tx_product_lookup() -> dict[str, tuple[str, str]]:
+    """构造"代码 token -> (product_code, product_name)"映射，用于从文件名反查产品。
+
+    同时收录 CITIC 账户号（如 104902）与 CICC 代码（如 SCD704），统一映射到
+    curated 层使用的规范 product_code（NAME_TO_PRODCODE）。
+    """
+    from fundadmin.clients.config import NAME_TO_PRODCODE
+
+    lut: dict[str, tuple[str, str]] = {}
+    for cfg in PRODUCT_CONFIG:
+        pname = cfg.get("name", "")
+        pcode = NAME_TO_PRODCODE.get(pname)
+        if not pcode:
+            continue
+        for tok in (cfg.get("citic_codes") or []) + (cfg.get("cicc_codes") or []):
+            if tok:
+                lut[str(tok)] = (pcode, pname)
+    return lut
+
+
+def _persist_transactions(
+    files: list[Path],
+    *,
+    effective_trade_date: date,
+) -> None:
+    """成交流水层：解析 CICC"当日交易" + CITIC"Transaction"全量入库（按 occ 去重）。
+
+    范围为全历史成交：
+    - CITIC Statement 的 Transaction sheet 为"当日"逐笔成交，故需遍历 inbox 中
+      所有日期的 Statement 文件（并非仅目标日），方能累积全历史。
+    - CICC"当日交易"sheet 为全历史成交，单份报告即含全量；occ 负责跨文件折叠重复。
+    跨文件/跨快照去重靠主键 + occ；入库失败仅告警，不阻断主流程。
+    """
+    from fundadmin.clients.store import upsert_transactions
+    from fundadmin.portfolio.parsers.trades import (
+        parse_cicc_trades,
+        parse_citic_transactions,
+    )
+
+    if not files:
+        return
+
+    lut = _build_tx_product_lookup()
+    tx_frames: list[pd.DataFrame] = []
+
+    for p in files:
+        name = p.name
+        suffix = p.suffix.lower()
+        # 反查产品：文件名中命中任一代码 token。
+        match = next((v for tok, v in lut.items() if tok in name), None)
+        if match is None:
+            continue
+        pcode, pname = match
+
+        if "Statement" in name and suffix in {".xlsx", ".xlsm", ".xls"}:
+            # CITIC 履约保障报告：Transaction sheet（当日逐笔成交）。
+            try:
+                tx = parse_citic_transactions(p)
+            except Exception:
+                logger.debug("parse_citic_transactions failed for %s", p, exc_info=True)
+                continue
+            broker = "citic"
+        elif suffix == ".xlsx" and "Statement" not in name:
+            # CICC 估值报告附件：当日交易 sheet（全历史成交）。无该 sheet 返回空表。
+            try:
+                tx = parse_cicc_trades(p)
+            except Exception:
+                logger.debug("parse_cicc_trades failed for %s", p, exc_info=True)
+                continue
+            broker = "cicc"
+        else:
+            continue
+
+        if tx is not None and not tx.empty:
+            tx = tx.copy()
+            tx["broker"] = broker
+            tx["product_code"] = pcode
+            tx["product_name"] = pname
+            tx_frames.append(tx)
+
+    if not tx_frames:
+        print("[OK] transactions: 0 row(s) (no trade records found)")
+        return
+
+    try:
+        n_tx = upsert_transactions(pd.concat(tx_frames, ignore_index=True))
+        print(f"[OK] transactions: {n_tx} row(s) upserted")
+    except Exception:
+        logger.exception("transactions persistence failed")
+
+
 def _build_product_reports_for_trade_date(
     *,
     trade_date: date,
@@ -1496,6 +1632,9 @@ def _build_product_reports_for_trade_date(
 
     # 核心结构层：从 build 结果写 product_valuation + fund_positions（失败仅告警）。
     _persist_curated_layer(results, effective_trade_date=effective_trade_date)
+
+    # 成交流水层：解析 CICC/CITIC 成交全量入库（按 occ 去重；失败仅告警）。
+    _persist_transactions(files, effective_trade_date=effective_trade_date)
 
     chart_paths: dict[str, Path] = {}
     if with_charts:
@@ -1769,6 +1908,58 @@ def _cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _collect_inbox_files_by_trade_date(
+    *, inbox_root: Path, asof_date: date, scan_days: int
+) -> dict[date, list[Path]]:
+    """扫描近 scan_days 天的收件日目录，按文件名嵌入的交易日重新分组。
+
+    券商报告 T+1/T+2 才到邮箱，同一交易日的文件常散落在多个收件日目录，
+    这里跨目录汇集，键为文件名解析出的交易日（仅保留不晚于 asof 的日期）。
+    """
+    grouped: dict[date, list[Path]] = {}
+    if not inbox_root.exists():
+        return grouped
+    earliest = asof_date - timedelta(days=max(0, int(scan_days)))
+    for child in sorted(inbox_root.iterdir()):
+        if not child.is_dir() or child.name.startswith("_"):
+            continue
+        try:
+            received = _parse_ymd(child.name)
+        except ValueError:
+            continue
+        if received < earliest or received > asof_date:
+            continue
+        for path in sorted(child.iterdir()):
+            if not path.is_file():
+                continue
+            for embedded in _extract_trade_dates_from_path(path):
+                if embedded > asof_date or embedded < earliest:
+                    continue
+                grouped.setdefault(embedded, []).append(path)
+    return grouped
+
+
+def _stage_trade_date_files(
+    *, inbox_root: Path, trade_date: date, files: list[Path]
+) -> Path:
+    """把某交易日的文件（可能跨多个收件目录）复制进单交易日暂存目录。
+
+    单交易日目录可让原始无损层与成交流水层避免被同目录的其它交易日文件污染。
+    同名文件按内容去重，只保留首个。
+    """
+    staged_root = inbox_root / "_staged" / trade_date.isoformat()
+    if staged_root.exists():
+        shutil.rmtree(staged_root)
+    _ensure_dir(staged_root)
+    seen_names: set[str] = set()
+    for src in files:
+        if not src.is_file() or src.name in seen_names:
+            continue
+        seen_names.add(src.name)
+        shutil.copy2(src, staged_root / src.name)
+    return staged_root
+
+
 def _cmd_sync_latest(args: argparse.Namespace) -> int:
     load_env()
     asof_date = _parse_optional_ymd(str(getattr(args, "asof", "") or "")) or date.today()
@@ -1786,13 +1977,13 @@ def _cmd_sync_latest(args: argparse.Namespace) -> int:
         inbox_root=inbox_root,
     )
 
+    # ---- 下载段：按收件日窗口拉取附件进 inbox/<收件日>/（IMAP 仅能按收件日检索）----
     total_saved = 0
     total_skipped = 0
-    built_reports = 0
-    for trade_date in resolved_dates:
-        out_dir = inbox_root / trade_date.isoformat()
+    for received_date in resolved_dates:
+        out_dir = inbox_root / received_date.isoformat()
         result = _run_email_sync_for_trade_date(
-            trade_date=trade_date,
+            trade_date=received_date,
             args=args,
             out_dir=out_dir,
             skip_processed=bool(getattr(args, "skip_processed", True)),
@@ -1801,30 +1992,75 @@ def _cmd_sync_latest(args: argparse.Namespace) -> int:
         total_saved += len(result.saved_paths)
         total_skipped += int(result.skipped_messages)
         print(
-            f"[OK] synced {trade_date.isoformat()} "
+            f"[OK] synced {received_date.isoformat()} "
             f"(saved={len(result.saved_paths)}, matched={result.matched_messages}, skipped={result.skipped_messages})"
         )
-        if bool(getattr(args, "build", True)):
+
+    # ---- 发布段：按文件名里的交易日重新分组，逐个交易日构建并发送 ----
+    # 券商报告 T+1/T+2 才到邮箱，一个收件日目录混着多个交易日；按交易日分组并跨目录汇集，
+    # 保证较旧但已补齐的交易日也能发出。已发渠道由 published_state 去重，不齐的留待次日补发。
+    built_reports = 0
+    matrix_sent = 0
+    clients_sent = 0
+    if bool(getattr(args, "build", True)):
+        with_email = bool(getattr(args, "with_email", False))
+        notify_clients = bool(getattr(args, "notify_clients", False))
+        republish = bool(getattr(args, "republish", False))
+        publish_state_path = _default_publish_state_path(inbox_root)
+        publish_state = _load_publish_state(publish_state_path)
+
+        grouped = _collect_inbox_files_by_trade_date(
+            inbox_root=inbox_root, asof_date=asof_date, scan_days=PUBLISH_SCAN_DAYS
+        )
+        emailing = with_email or notify_clients
+        for trade_date in sorted(grouped):
+            want_matrix = with_email and (
+                republish or not _publish_channel_done(publish_state, trade_date, "matrix")
+            )
+            want_clients = notify_clients and (
+                republish or not _publish_channel_done(publish_state, trade_date, "clients")
+            )
+            if emailing:
+                # 发邮件模式：该交易日所有请求渠道都已发布则跳过，避免重复发送/重复解析。
+                if not want_matrix and not want_clients:
+                    continue
+            else:
+                # 纯同步模式：仅为尚无报表的交易日补建报表，已存在的不重复解析。
+                if (report_root / trade_date.isoformat()).exists():
+                    continue
+
+            staged_dir = _stage_trade_date_files(
+                inbox_root=inbox_root, trade_date=trade_date, files=grouped[trade_date]
+            )
             try:
                 payload = _build_product_reports_for_trade_date(
                     trade_date=trade_date,
-                    inbox_dir=out_dir,
+                    inbox_dir=staged_dir,
                     report_root=report_root,
-                    with_email=bool(getattr(args, "with_email", False)),
-                    notify_clients=bool(getattr(args, "notify_clients", False)),
+                    with_email=want_matrix,
+                    notify_clients=want_clients,
                     email_to=str(getattr(args, "email_to", "") or ""),
-                )
-                built_reports += 1
-                print(
-                    f"[OK] built product reports for {payload['trade_date']}: "
-                    f"{payload['summary_xlsx'] or payload['out_dir']}"
                 )
             except Exception:
                 logger.exception("build skipped for %s", trade_date.isoformat())
+                continue
+            built_reports += 1
+            print(
+                f"[OK] built product reports for {payload['trade_date']}: "
+                f"{payload['summary_xlsx'] or payload['out_dir']}"
+            )
+            if want_matrix and payload.get("email_sent"):
+                _mark_publish_channel(publish_state, trade_date, "matrix")
+                matrix_sent += 1
+            if want_clients and int(payload.get("client_notify_sent") or 0) > 0:
+                _mark_publish_channel(publish_state, trade_date, "clients")
+                clients_sent += 1
+            _save_publish_state(publish_state_path, publish_state)
 
     print(
-        f"[OK] sync-latest finished: dates={len(resolved_dates)}, "
-        f"saved_attachments={total_saved}, skipped_messages={total_skipped}, built_reports={built_reports}"
+        f"[OK] sync-latest finished: received_dates={len(resolved_dates)}, "
+        f"saved_attachments={total_saved}, skipped_messages={total_skipped}, "
+        f"built_reports={built_reports}, matrix_sent={matrix_sent}, clients_sent={clients_sent}"
     )
     if state_file is not None:
         print(f"state_file: {state_file}")
@@ -1933,6 +2169,62 @@ def _cmd_notify_clients(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reconcile(args: argparse.Namespace) -> int:
+    """交叉核对：持仓数量 vs 成交流水净额。
+
+    默认 delta 模式（相邻估值日持仓变动 vs 区间成交净额），
+    可选 cumulative 模式（每日持仓 vs 累计净额）。
+    """
+    load_env()
+    from fundadmin.clients.config import NAME_TO_PRODCODE
+    from fundadmin.portfolio.reconcile import (
+        reconcile_around_date,
+        reconcile_holding_deltas,
+        reconcile_positions_vs_trades,
+    )
+
+    raw = str(getattr(args, "product", "") or "").strip()
+    product_code = NAME_TO_PRODCODE.get(raw, raw)  # 接受产品名或代码
+    if not product_code:
+        print("[ERROR] --product 必填（产品名如 铂金8号，或代码如 SXQ602）")
+        return 1
+
+    mode = str(getattr(args, "mode", "delta") or "delta")
+    center = str(getattr(args, "around", "") or "").strip()
+    window = int(getattr(args, "window", 2) or 2)
+    only_issues = bool(getattr(args, "only_issues", False))
+
+    if center:
+        df = reconcile_around_date(product_code, center, window=window, mode=mode)
+    elif mode == "delta":
+        df = reconcile_holding_deltas(product_code)
+    else:
+        df = reconcile_positions_vs_trades(product_code)
+
+    if df.empty:
+        print(f"[OK] {product_code}: 无可核对数据（缺少持仓或成交）")
+        return 0
+
+    if only_issues:
+        df = df[df["status"] != "ok"]
+        if df.empty:
+            print(f"[OK] {product_code}: 全部一致，无差异")
+            return 0
+
+    n_mismatch = int((df["status"] != "ok").sum())
+    print(f"[{'WARN' if n_mismatch else 'OK'}] {product_code} reconcile ({mode}): "
+          f"{len(df)} row(s), {n_mismatch} issue(s)")
+    with pd.option_context("display.max_rows", None, "display.width", 200):
+        print(df.to_string(index=False))
+
+    out = str(getattr(args, "out_csv", "") or "").strip()
+    if out:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out, index=False, encoding="utf-8-sig")
+        print(f"[OK] written: {out}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser("fund_portfolio")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1976,6 +2268,7 @@ def main(argv: list[str] | None = None) -> int:
     parser_sync.add_argument("--with-email", action="store_true", default=False, help="Send internal matrix summary email after each successful, data-complete build.")
     parser_sync.add_argument("--notify-clients", action="store_true", default=False, help="Send client NAV notification emails after each successful, data-complete build.")
     parser_sync.add_argument("--email-to", default="", help="Comma-separated matrix-email recipients (or set EMAIL_TO env var).")
+    parser_sync.add_argument("--republish", action="store_true", default=False, help="Ignore published-state and resend matrix/client emails for in-window trade dates (manual re-send).")
     parser_sync.set_defaults(func=_cmd_sync_latest)
 
     parser_build = sub.add_parser("build", help="Compatibility alias of build-products. Prefer build-products.")
@@ -2038,6 +2331,19 @@ def main(argv: list[str] | None = None) -> int:
     parser_nc.add_argument("--smtp-pass", default="", help="Override SMTP_PASS.")
     parser_nc.add_argument("--smtp-from", default="", help="Override EMAIL_FROM.")
     parser_nc.set_defaults(func=_cmd_notify_clients)
+
+    parser_rec = sub.add_parser(
+        "reconcile",
+        help="Cross-check holdings quantity vs transaction net (持仓 vs 成交流水交叉核对).",
+    )
+    parser_rec.add_argument("--product", required=True, help="产品名（如 铂金8号）或代码（如 SXQ602）。")
+    parser_rec.add_argument("--mode", choices=["delta", "cumulative"], default="delta",
+                            help="delta=相邻日持仓变动 vs 区间成交净额（默认）；cumulative=每日持仓 vs 累计净额。")
+    parser_rec.add_argument("--around", default="", help="以该估值日为中心核对前后 ±window 个交易日（YYYY-MM-DD）。")
+    parser_rec.add_argument("--window", type=int, default=2, help="--around 的前后窗口大小，默认 2。")
+    parser_rec.add_argument("--only-issues", action="store_true", default=False, help="仅显示 status != ok 的差异行。")
+    parser_rec.add_argument("--out-csv", default="", help="可选：将核对明细写出为 CSV。")
+    parser_rec.set_defaults(func=_cmd_reconcile)
 
     args = parser.parse_args(argv)
     func = getattr(args, "func", None)

@@ -115,6 +115,9 @@ _DDL_STATEMENTS: tuple[str, ...] = (
         market_value_cny    REAL,
         market_value_local  REAL,
         weight              REAL,
+        cost_price_local    REAL,
+        cost_value_local    REAL,
+        cost_ccy            TEXT,
         financing_cost      REAL,
         init_margin         REAL,
         maint_margin        REAL,
@@ -127,6 +130,36 @@ _DDL_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS ix_positions_product ON fund_positions(product_code, as_of_date)",
+    # 成交流水：来自中金"当日交易"、中信"Transaction"sheet。
+    # 中金"当日交易"为全历史成交（可回溯数年），每日报告重复出现；
+    # 跨文件去重靠主键，文件内同键真实重复用 occ 序号区分（避免净额对不上持仓）。
+    """
+    CREATE TABLE IF NOT EXISTS fund_transactions (
+        trade_date      TEXT NOT NULL,
+        product_code    TEXT NOT NULL,
+        product_name    TEXT NOT NULL DEFAULT '',
+        broker          TEXT NOT NULL DEFAULT '',
+        ticker          TEXT NOT NULL DEFAULT '',
+        instrument_name TEXT NOT NULL DEFAULT '',
+        direction       TEXT NOT NULL DEFAULT '',
+        open_close      TEXT NOT NULL DEFAULT '',
+        price_local     REAL,
+        quantity        REAL,
+        amount_local    REAL,
+        amount_cny      REAL,
+        fee             REAL,
+        realized_pnl    REAL,
+        currency        TEXT,
+        contract_no     TEXT NOT NULL DEFAULT '',
+        occ             INTEGER NOT NULL DEFAULT 0,
+        source_file     TEXT,
+        ingest_id       INTEGER,
+        loaded_at       TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (broker, product_code, ticker, trade_date, direction, open_close, price_local, quantity, contract_no, occ)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_tx_product_date ON fund_transactions(product_code, trade_date)",
+    "CREATE INDEX IF NOT EXISTS ix_tx_ticker ON fund_transactions(product_code, ticker, trade_date)",
     # 产品级净值/规模（与 product_nav_history 互补，含市值/资产净值）。
     """
     CREATE TABLE IF NOT EXISTS product_valuation (
@@ -151,12 +184,34 @@ def get_engine() -> Engine:
     return _create_engine(resolve_db_url())
 
 
+# 旧库补列：列名 -> 列定义。新增列必须可空（无 NOT NULL/无默认冲突）。
+_POSITION_ADD_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("cost_price_local", "REAL"),
+    ("cost_value_local", "REAL"),
+    ("cost_ccy", "TEXT"),
+)
+
+
+def _existing_columns(conn, table: str) -> set[str]:
+    rows = conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+    return {str(r[1]) for r in rows}
+
+
 def init_db(engine: Engine | None = None) -> Engine:
-    """创建/补齐全部表与索引；多次执行幂等。"""
+    """创建/补齐全部表与索引；多次执行幂等。
+
+    - CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，因此对 fund_positions
+      额外做 ALTER TABLE ADD COLUMN 补齐新增的成本列（幂等）。
+    """
     eng = engine or get_engine()
     with eng.begin() as conn:
         for stmt in _DDL_STATEMENTS:
             conn.exec_driver_sql(stmt)
+        # 旧库迁移：补齐 fund_positions 新增列。
+        existing = _existing_columns(conn, "fund_positions")
+        for col, decl in _POSITION_ADD_COLUMNS:
+            if col not in existing:
+                conn.exec_driver_sql(f"ALTER TABLE fund_positions ADD COLUMN {col} {decl}")
     return eng
 
 

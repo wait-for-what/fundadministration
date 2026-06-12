@@ -26,6 +26,14 @@ CITIC_NAME_LABELS = {"证券名称", "标的名称", "名称"}
 CITIC_CODE_LABELS = {"证券代码", "标的代码", "代码"}
 CITIC_QTY_LABELS = {"标的名义数量加总", "名义数量加总", "持仓数量", "数量"}
 CITIC_MV_LABELS = {"标的市值（交易货币）", "市值（交易货币）", "标的市值", "市值"}
+# 成本相关列头别名（交易货币口径）
+CITIC_UNIT_COST_LABELS = {"平均单位持仓成本（交易货币）", "平均单位持仓成本(交易货币)", "平均单位持仓成本"}
+CITIC_COST_VALUE_LABELS = {
+    "该标的持仓成本加总的近似值（交易货币）",
+    "该标的持仓成本加总的近似值(交易货币)",
+    "该标的持仓成本加总",
+}
+CITIC_CCY_LABELS = {"交易货币", "计价货币", "币种"}
 
 # Balance 汇率列头别名
 CITIC_FX_LABELS = {"汇率（交易货币/结算货币）", "汇率", "汇率(交易货币/结算货币)"}
@@ -110,7 +118,14 @@ def parse_citic_underlying(underlying_path: Path, fx: float, *, sheet: str | int
         - company: 公司名称
         - shares: 持仓股数
         - market_value_cny: 市值（人民币）
+        - cost_price_local: 平均单位持仓成本（交易货币，每股）
+        - cost_value_local: 该标的持仓成本加总（交易货币）
+        - cost_ccy: 交易货币（USD/HKD）
         - source_file: 来源文件名
+
+    说明：
+        - 成本仅对真实持仓（标的市值 > 0）赋值；方向为 0 的占位行（市值为 0、
+          平均成本为残值）不赋成本，避免污染成本看板。
     """
     suffix = underlying_path.suffix.lower()
     if suffix == ".csv":
@@ -143,6 +158,12 @@ def parse_citic_underlying(underlying_path: Path, fx: float, *, sheet: str | int
             col_map[col] = "shares"
         elif text in CITIC_MV_LABELS:
             col_map[col] = "market_value"
+        elif text in CITIC_UNIT_COST_LABELS:
+            col_map[col] = "unit_cost"
+        elif text in CITIC_COST_VALUE_LABELS:
+            col_map[col] = "cost_value"
+        elif text in CITIC_CCY_LABELS and "ccy" not in col_map.values():
+            col_map[col] = "ccy"
 
     df = df.rename(columns=col_map)
 
@@ -151,22 +172,38 @@ def parse_citic_underlying(underlying_path: Path, fx: float, *, sheet: str | int
     if "shares" not in df.columns:
         raise ValueError(f"中信底层资产表缺少持仓数量列: {underlying_path}")
 
+    out_cols = [
+        "ticker", "company", "shares", "market_value_cny",
+        "cost_price_local", "cost_value_local", "cost_ccy", "source_file",
+    ]
+
     # 过滤空仓位
     df["shares_num"] = df["shares"].map(to_float).fillna(0.0)
     df = df[df["shares_num"] > 0].copy()
     if df.empty:
-        return pd.DataFrame(columns=["ticker", "company", "shares", "market_value_cny", "source_file"])
+        return pd.DataFrame(columns=out_cols)
+
+    mv_local = df["market_value"].map(to_float) if "market_value" in df.columns else pd.Series([None] * len(df))
 
     out = pd.DataFrame()
     out["company"] = df["company"].astype(str).str.strip()
     out["ticker"] = df["code"].map(clean_ticker) if "code" in df.columns else ""
     out["shares"] = df["shares"].map(to_int)
+    out["market_value_cny"] = mv_local * fx
 
-    mv = df["market_value"].map(to_float) if "market_value" in df.columns else pd.Series([None] * len(df))
-    out["market_value_cny"] = mv * fx
+    # 成本（交易货币口径），仅对真实持仓（标的市值 > 0）赋值。
+    real = mv_local.fillna(0.0) > 0
+    unit_cost = df["unit_cost"].map(to_float) if "unit_cost" in df.columns else pd.Series([None] * len(df))
+    cost_value = df["cost_value"].map(to_float) if "cost_value" in df.columns else pd.Series([None] * len(df))
+    out["cost_price_local"] = unit_cost.where(real, other=None)
+    out["cost_value_local"] = cost_value.where(real, other=None)
+    if "ccy" in df.columns:
+        out["cost_ccy"] = df["ccy"].astype(str).str.strip().where(real, other=None)
+    else:
+        out["cost_ccy"] = None
     out["source_file"] = underlying_path.name
 
-    return out
+    return out[out_cols]
 
 
 def parse_citics_derivative_holdings(path: Path) -> pd.DataFrame:

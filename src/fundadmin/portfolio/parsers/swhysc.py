@@ -133,6 +133,9 @@ def parse_swhysc_holdings(path: Path) -> pd.DataFrame:
         - company: 公司名称
         - shares: 持仓股数
         - market_value_cny: 市值（人民币，元）
+        - cost_price_local: 单位成本（人民币，元/股）
+        - cost_value_local: 持仓成本（人民币，元）= 单位成本 × 数量
+        - cost_ccy: 计价货币（境内估值表恒为 CNY）
         - source_file: 来源文件名
     """
     df_raw = pd.read_excel(path, sheet_name=0, header=None, dtype=object, engine="openpyxl")
@@ -143,7 +146,8 @@ def parse_swhysc_holdings(path: Path) -> pd.DataFrame:
     df = df_raw.iloc[header_row + 1 :].copy()
     df.columns = df_raw.iloc[header_row]
 
-    # 重命名列便于访问
+    # 重命名列便于访问。"单位成本"在两种模板（.xls/.xlsx）中列名唯一，直接取每股成本，
+    # 避免 .xls 中"成本"列重复（原币/本币）带来的歧义。
     col_map: dict[str, str] = {}
     for col in df.columns:
         text = str(col).strip()
@@ -155,6 +159,8 @@ def parse_swhysc_holdings(path: Path) -> pd.DataFrame:
             col_map[col] = "shares"
         elif text == "市值":
             col_map[col] = "market_value"
+        elif text == "单位成本":
+            col_map[col] = "unit_cost"
 
     df = df.rename(columns=col_map)
 
@@ -182,17 +188,25 @@ def parse_swhysc_holdings(path: Path) -> pd.DataFrame:
         if suffix:
             ticker = ticker + suffix
 
+        unit_cost = to_float(row.get("unit_cost")) if "unit_cost" in df.columns else None
         rows.append(
             {
                 "ticker": ticker,
                 "company": str(row.get("name", "")).strip(),
                 "shares": shares,
                 "market_value_cny": mv,
+                "cost_price_local": unit_cost,
+                "cost_value_local": (unit_cost * shares) if unit_cost is not None else None,
+                "cost_ccy": "CNY",
                 "source_file": path.name,
             }
         )
 
+    cols = [
+        "ticker", "company", "shares", "market_value_cny",
+        "cost_price_local", "cost_value_local", "cost_ccy", "source_file",
+    ]
     if not rows:
-        return pd.DataFrame(columns=["ticker", "company", "shares", "market_value_cny", "source_file"])
+        return pd.DataFrame(columns=cols)
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=cols)

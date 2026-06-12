@@ -88,6 +88,9 @@ _POSITION_COLS: tuple[str, ...] = (
     "market_value_cny",
     "market_value_local",
     "weight",
+    "cost_price_local",
+    "cost_value_local",
+    "cost_ccy",
     "financing_cost",
     "init_margin",
     "maint_margin",
@@ -95,6 +98,40 @@ _POSITION_COLS: tuple[str, ...] = (
     "contract_no",
     "source_files",
     "ingest_id",
+)
+_TRANSACTION_COLS: tuple[str, ...] = (
+    "trade_date",
+    "product_code",
+    "product_name",
+    "broker",
+    "ticker",
+    "instrument_name",
+    "direction",
+    "open_close",
+    "price_local",
+    "quantity",
+    "amount_local",
+    "amount_cny",
+    "fee",
+    "realized_pnl",
+    "currency",
+    "contract_no",
+    "occ",
+    "source_file",
+    "ingest_id",
+)
+# 成交流水主键：occ 为文件内同键去重序号（区分真实重复成交）。
+_TRANSACTION_PK: tuple[str, ...] = (
+    "broker",
+    "product_code",
+    "ticker",
+    "trade_date",
+    "direction",
+    "open_close",
+    "price_local",
+    "quantity",
+    "contract_no",
+    "occ",
 )
 _VALUATION_COLS: tuple[str, ...] = (
     "as_of_date",
@@ -252,6 +289,51 @@ def upsert_positions(df: pd.DataFrame, *, engine: Engine | None = None) -> int:
     )
 
 
+def _assign_occ(df: pd.DataFrame, pk_no_occ: Sequence[str]) -> pd.Series:
+    """为同键的真实重复成交分配出现序号 occ（0,1,2...）。
+
+    pandas groupby 会丢弃含 NaN 的分组键，故用稳定字符串键做 cumcount，
+    保证 None/NaN 也能参与分组。全历史在每日报告中按相同顺序重复出现，
+    因此同一笔成交在不同文件里获得相同 occ → ON CONFLICT 折叠去重；
+    文件内真实重复的同键成交获得 0/1/2 → 不被误折叠。
+    """
+    def _key(row: pd.Series) -> str:
+        parts = []
+        for c in pk_no_occ:
+            v = row.get(c)
+            parts.append("" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v))
+        return "\x1f".join(parts)
+
+    keys = df.apply(_key, axis=1)
+    return keys.groupby(keys).cumcount()
+
+
+def upsert_transactions(df: pd.DataFrame, *, engine: Engine | None = None) -> int:
+    """写入成交流水。主键见 _TRANSACTION_PK（含 occ 去重序号）。
+
+    occ 由本函数按"主键去 occ"分组计算，调用方无需提供。
+    """
+    eng = engine or get_engine()
+    payload = _normalize(
+        df,
+        _TRANSACTION_COLS,
+        defaults={
+            "broker": "",
+            "product_name": "",
+            "ticker": "",
+            "instrument_name": "",
+            "direction": "",
+            "open_close": "",
+            "contract_no": "",
+        },
+    )
+    for col in ("broker", "ticker", "instrument_name", "direction", "open_close", "contract_no"):
+        payload[col] = payload[col].fillna("").astype(str)
+    pk_no_occ = [c for c in _TRANSACTION_PK if c != "occ"]
+    payload["occ"] = _assign_occ(payload, pk_no_occ).astype(int)
+    return _upsert(eng, "fund_transactions", _TRANSACTION_COLS, _TRANSACTION_PK, payload)
+
+
 def upsert_product_valuation(df: pd.DataFrame, *, engine: Engine | None = None) -> int:
     """写入产品级净值/规模。主键 (as_of_date, product_code)。"""
     eng = engine or get_engine()
@@ -379,6 +461,41 @@ def load_product_valuation(
     return pd.read_sql(sql, eng)
 
 
+def load_transactions(
+    *,
+    product_code: str | None = None,
+    ticker: str | None = None,
+    trade_date: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    engine: Engine | None = None,
+) -> pd.DataFrame:
+    """按产品/标的/日期（或日期区间）筛选成交流水；不传则返回全部。"""
+    eng = engine or get_engine()
+    clauses = []
+    params: dict[str, object] = {}
+    if product_code:
+        clauses.append("product_code = :product_code")
+        params["product_code"] = product_code
+    if ticker:
+        clauses.append("ticker = :ticker")
+        params["ticker"] = ticker
+    if trade_date:
+        clauses.append("trade_date = :trade_date")
+        params["trade_date"] = trade_date
+    if date_from:
+        clauses.append("trade_date >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        clauses.append("trade_date <= :date_to")
+        params["date_to"] = date_to
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = text(
+        f"SELECT * FROM fund_transactions {where} ORDER BY trade_date, ticker, occ"
+    )
+    return pd.read_sql(sql, eng, params=params)
+
+
 def load_raw_sheet_rows(ingest_id: int, *, engine: Engine | None = None) -> pd.DataFrame:
     """读取某个附件的全部原始行（按 sheet/row 顺序）。"""
     eng = engine or get_engine()
@@ -395,6 +512,7 @@ __all__ = [
     "insert_attachment",
     "upsert_raw_sheet_rows",
     "upsert_positions",
+    "upsert_transactions",
     "upsert_product_valuation",
     "load_holdings",
     "list_holdings_dates",
@@ -404,6 +522,7 @@ __all__ = [
     "load_nav_asof",
     "list_nav_dates",
     "load_positions",
+    "load_transactions",
     "load_product_valuation",
     "load_raw_sheet_rows",
 ]

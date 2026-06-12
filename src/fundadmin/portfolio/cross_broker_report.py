@@ -33,6 +33,10 @@ from fundadmin.portfolio.parsers.swhysc import (
     parse_swhysc_holdings,
     parse_swhysc_navs,
 )
+from fundadmin.portfolio.parsers.trades import (
+    compute_position_cost_from_trades,
+    parse_cicc_trades,
+)
 from fundadmin.portfolio.parsers.valuation_nav import parse_nav_from_valuation
 
 logger = logging.getLogger(__name__)
@@ -169,6 +173,47 @@ def _load_valuation_frames(paths: list[Path] | None) -> list[pd.DataFrame]:
     return frames
 
 
+def _cicc_cost_map(cicc_paths: list[Path] | None) -> dict[str, dict[str, Any]]:
+    """从 CICC 全历史成交流水按移动加权法推算每个 ticker 的本地币持仓成本。
+
+    CICC "持仓" sheet 无原生每股成本，需由"当日交易"成交流水推算。
+    返回 {ticker_norm: {cost_price_local, cost_value_local, cost_ccy}}。
+    """
+    if not cicc_paths:
+        return {}
+    trade_frames: list[pd.DataFrame] = []
+    for p in cicc_paths:
+        if not p.exists() or p.suffix.lower() != ".xlsx":
+            continue
+        try:
+            tx = parse_cicc_trades(p)
+        except Exception:
+            logger.debug("parse_cicc_trades failed for %s", p, exc_info=True)
+            continue
+        if not tx.empty:
+            trade_frames.append(tx)
+    if not trade_frames:
+        return {}
+    all_tx = pd.concat(trade_frames, ignore_index=True)
+    # 跨文件去重：全历史在每日报告中重复出现，按业务键去重保留一条。
+    dedup_keys = [
+        "trade_date", "ticker", "direction", "open_close",
+        "price_local", "quantity", "contract_no",
+    ]
+    present = [c for c in dedup_keys if c in all_tx.columns]
+    all_tx = all_tx.drop_duplicates(subset=present, keep="first")
+    cost = compute_position_cost_from_trades(all_tx)
+    out: dict[str, dict[str, Any]] = {}
+    for _, r in cost.iterrows():
+        norm = clean_ticker(r["ticker"])
+        out[norm] = {
+            "cost_price_local": r.get("cost_price_local"),
+            "cost_value_local": r.get("cost_value_local"),
+            "cost_ccy": r.get("cost_ccy"),
+        }
+    return out
+
+
 def build_cross_broker_report(
     *,
     trade_date: date,
@@ -288,12 +333,25 @@ def build_cross_broker_report(
 
     holdings = pd.concat(valid_frames, ignore_index=True)
 
+    # 补齐缺失的成本列（CICC 持仓 sheet 无原生成本，后续由成交流水回填）。
+    for col in ("cost_price_local", "cost_value_local", "cost_ccy"):
+        if col not in holdings.columns:
+            holdings[col] = None
+    # 成本金额转数值，确保 groupby 求和正确（None/空值视为缺失）。
+    holdings["cost_value_local"] = pd.to_numeric(holdings["cost_value_local"], errors="coerce")
+
     # 3. 按 ticker 合并
     # 先标准化 ticker（去掉交易所后缀，如 TSLA.US -> TSLA，0286.HK -> 0286），
     # 确保不同来源的同一标的能够正确合并。
     # ticker 为空时用 company 兜底。
     holdings["ticker_norm"] = holdings["ticker"].map(clean_ticker)
     holdings["group_key"] = holdings["ticker_norm"].where(holdings["ticker_norm"].str.strip() != "", holdings["company"])
+
+    def _first_non_null(s: pd.Series) -> Any:
+        for v in s:
+            if v is not None and not (isinstance(v, float) and pd.isna(v)) and str(v).strip() != "":
+                return v
+        return None
 
     aggregated = (
         holdings.groupby("group_key", as_index=False)
@@ -302,11 +360,38 @@ def build_cross_broker_report(
             company=("company", "first"),
             shares=("shares", "sum"),
             market_value_cny=("market_value_cny", "sum"),
+            cost_value_local=("cost_value_local", "sum"),
+            cost_ccy=("cost_ccy", _first_non_null),
             source_files=("source_file", lambda s: ",".join(s.drop_duplicates().tolist())),
         )
         .sort_values("market_value_cny", ascending=False, na_position="last")
         .reset_index(drop=True)
     )
+
+    # 本地币每股成本 = 持仓成本加总 / 股数（成本看板使用 local currency）。
+    # CICC 持仓无原生成本：用全历史成交流水按移动加权法回填。
+    cicc_cost = _cicc_cost_map(cicc_paths)
+    if cicc_cost:
+        for i in aggregated.index:
+            cv = aggregated.at[i, "cost_value_local"]
+            if cv is not None and not (isinstance(cv, float) and pd.isna(cv)) and cv != 0:
+                continue
+            norm = clean_ticker(aggregated.at[i, "ticker"])
+            info = cicc_cost.get(norm)
+            if info:
+                aggregated.at[i, "cost_value_local"] = info["cost_value_local"]
+                aggregated.at[i, "cost_ccy"] = info["cost_ccy"]
+
+    def _per_share_cost(row: pd.Series) -> Any:
+        cv = row["cost_value_local"]
+        sh = row["shares"]
+        if cv is None or (isinstance(cv, float) and pd.isna(cv)) or cv == 0:
+            return None
+        if sh is None or (isinstance(sh, float) and pd.isna(sh)) or sh == 0:
+            return None
+        return cv / sh
+
+    aggregated["cost_price_local"] = aggregated.apply(_per_share_cost, axis=1)
 
     # 4. 计算权重
     if nav and nav > 0:
@@ -326,6 +411,13 @@ def build_cross_broker_report(
     fmt["weight"] = fmt["weight"].apply(
         lambda x: f"{x:.2%}" if pd.notna(x) else ""
     )
+    fmt["cost_price_local"] = fmt["cost_price_local"].apply(
+        lambda x: f"{x:,.4f}" if pd.notna(x) else ""
+    )
+    fmt["cost_value_local"] = fmt["cost_value_local"].apply(
+        lambda x: f"{x:,.2f}" if pd.notna(x) else ""
+    )
+    fmt["cost_ccy"] = fmt["cost_ccy"].fillna("")
 
     summary = pd.DataFrame(
         [
