@@ -33,6 +33,22 @@ PRODCODE_TO_NAME: Mapping[str, str] = {
 # 名称 -> 产品代码（PRODCODE_TO_NAME 的反查；供 product_name -> product_code 入库映射）
 NAME_TO_PRODCODE: Mapping[str, str] = {name: code for code, name in PRODCODE_TO_NAME.items()}
 
+# 券商来源代码 -> 中文名（供分券商持仓展示/报表使用）。
+# 代码取自 cross_broker_report 各 loader 的来源标记与 _infer_broker_from_name。
+BROKER_TO_NAME: Mapping[str, str] = {
+    "cicc": "中金",
+    "citic": "中信",
+    "swhysc": "申万宏源",
+    "unknown": "未知",
+    "": "未知",
+}
+
+
+def broker_label(code: object) -> str:
+    """券商代码转中文名；未知代码原样返回（非空）或回退为'未知'。"""
+    key = str(code or "").strip()
+    return BROKER_TO_NAME.get(key, key or "未知")
+
 
 def resolve_db_url() -> str:
     """读取 FUND_DB_URL；缺失时报错。

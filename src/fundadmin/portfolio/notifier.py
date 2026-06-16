@@ -305,19 +305,19 @@ def _safe_cid(name: str) -> str:
 # ---- 持仓权重矩阵邮件 ----
 
 
-def build_weight_matrix_html(
+def build_weight_matrix_table(
     results: list[dict[str, Any]],
     trade_date: date,
-    chart_paths: dict[str, Path],
     *,
     exclude_products: set[str] | None = None,
 ) -> str:
-    """生成持仓权重矩阵 HTML 邮件正文。
+    """仅生成持仓权重矩阵表格（``<table>…</table>``，全 inline 样式，可独立嵌入）。
 
     表格结构：
-    - 第一行表头：标的名称 | 产品A | 产品B | ...
-    - 第一列：所有标的（去重，按字母序）
-    - 单元格：权重百分比（如 12.34%），无持仓留空
+    - 表头：标的名称 | 产品A | 产品B | ...
+    - 紧随的单位净值/资产净值行
+    - 每只标的一行（权重百分比，无持仓留 —），末行总权重
+    无有效数据时返回一段提示文本（非表格）。
     """
     import pandas as pd
 
@@ -350,8 +350,7 @@ def build_weight_matrix_html(
     product_names = sorted(product_weights.keys())
 
     if not all_tickers or not product_names:
-        return f"""<!DOCTYPE html>
-<html><body><p>{trade_date.isoformat()} 无有效持仓数据。</p></body></html>"""
+        return f"<p style='color:#888;font-size:13px'>{trade_date.isoformat()} 无有效持仓数据。</p>"
 
     # 按第一个产品的权重降序排列标的；权重为 None 的排最后（按字母序）
     first_product = product_names[0]
@@ -361,11 +360,21 @@ def build_weight_matrix_html(
         reverse=True,
     )
 
-    # 构建 HTML 表格行
     header_cols = ["<th style='background:#4a90d9;color:#fff;padding:10px 12px;border:1px solid #ddd;text-align:center;'>标的名称</th>"]
     for pname in product_names:
         header_cols.append(f"<th style='background:#4a90d9;color:#fff;padding:10px 12px;border:1px solid #ddd;text-align:center;white-space:nowrap;'>{pname}</th>")
     header_row = "<tr>" + "".join(header_cols) + "</tr>"
+
+    # 单位净值 / 资产净值 行
+    nav_rows: list[str] = []
+    for label, key, fmt in [("单位净值", "unit_nav", ":,.4f"), ("资产净值", "asset_nav", ":,.2f")]:
+        cells = [f"<td style='padding:6px 10px;border:1px solid #ddd;background:#f0f4f8;font-weight:600;'>{label}</td>"]
+        for pname in product_names:
+            r = next((x for x in results if x.get("product_name") == pname), {})
+            val = r.get(key)
+            val_str = format(val, fmt[1:]) if val is not None else "N/A"
+            cells.append(f"<td style='padding:6px 10px;border:1px solid #ddd;text-align:right;background:#f0f4f8;'>{val_str}</td>")
+        nav_rows.append("<tr>" + "".join(cells) + "</tr>")
 
     body_rows: list[str] = []
     for i, ticker in enumerate(ticker_list):
@@ -389,7 +398,28 @@ def build_weight_matrix_html(
         )
     body_rows.append("<tr>" + "".join(total_cells) + "</tr>")
 
-    # 图表区域（排除产品）
+    return (
+        "<table style='border-collapse:collapse;width:100%;margin:12px 0;font-size:12px;'>"
+        f"<thead>{header_row}{''.join(nav_rows)}</thead>"
+        f"<tbody>{''.join(body_rows)}</tbody></table>"
+    )
+
+
+def build_weight_matrix_html(
+    results: list[dict[str, Any]],
+    trade_date: date,
+    chart_paths: dict[str, Path],
+    *,
+    exclude_products: set[str] | None = None,
+) -> str:
+    """生成持仓权重矩阵 HTML 邮件正文（矩阵表 + 各产品饼图 + 页脚）。"""
+    exclude = exclude_products or set()
+    table_html = build_weight_matrix_table(results, trade_date, exclude_products=exclude)
+
+    # 图表区域（排除指定产品），顺序与矩阵列一致。
+    product_names = sorted(
+        {r.get("product_name", "") for r in results if r.get("product_name", "") not in exclude}
+    )
     chart_sections: list[str] = []
     for pname in product_names:
         chart_path = chart_paths.get(pname)
@@ -402,17 +432,6 @@ def build_weight_matrix_html(
                 f"</div>"
             )
 
-    # 产品净值汇总行
-    nav_rows: list[str] = []
-    for label, key, fmt in [("单位净值", "unit_nav", ":,.4f"), ("资产净值", "asset_nav", ":,.2f")]:
-        cells = [f"<td style='padding:6px 10px;border:1px solid #ddd;background:#f0f4f8;font-weight:600;'>{label}</td>"]
-        for pname in product_names:
-            r = next((x for x in results if x.get("product_name") == pname), {})
-            val = r.get(key)
-            val_str = format(val, fmt[1:]) if val is not None else "N/A"
-            cells.append(f"<td style='padding:6px 10px;border:1px solid #ddd;text-align:right;background:#f0f4f8;'>{val_str}</td>")
-        nav_rows.append("<tr>" + "".join(cells) + "</tr>")
-
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -420,23 +439,12 @@ def build_weight_matrix_html(
 <style>
 body {{ font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color: #333; line-height: 1.6; max-width: 1200px; margin: 0 auto; padding: 20px; }}
 h2 {{ font-size: 18px; color: #1a1a1a; border-bottom: 2px solid #4a90d9; padding-bottom: 8px; margin-top: 28px; }}
-.matrix-table {{ border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 12px; }}
-.matrix-table th {{ padding: 10px 12px; border: 1px solid #ddd; text-align: center; }}
-.matrix-table td {{ padding: 6px 10px; border: 1px solid #ddd; }}
 .footer {{ margin-top: 32px; padding-top: 16px; border-top: 1px solid #eee; font-size: 12px; color: #888; }}
 </style>
 </head>
 <body>
 <h2>📊 持仓权重矩阵 — {trade_date.isoformat()}</h2>
-<table class="matrix-table">
-<thead>
-{header_row}
-{''.join(nav_rows)}
-</thead>
-<tbody>
-{''.join(body_rows)}
-</tbody>
-</table>
+{table_html}
 
 <h2>📈 持仓分布</h2>
 {''.join(chart_sections)}

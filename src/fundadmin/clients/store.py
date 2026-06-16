@@ -334,6 +334,30 @@ def upsert_transactions(df: pd.DataFrame, *, engine: Engine | None = None) -> in
     return _upsert(eng, "fund_transactions", _TRANSACTION_COLS, _TRANSACTION_PK, payload)
 
 
+def delete_positions(
+    product_code: str,
+    as_of_date: str,
+    *,
+    engine: Engine | None = None,
+) -> int:
+    """删除某产品某估值日的全部持仓行，返回删除行数。
+
+    用于分券商重建：写入前先清空 (product_code, as_of_date) 的旧快照，
+    保证重跑幂等，避免旧的 broker='' 折叠行与新的分券商行并存导致重复计数，
+    也清理已清仓但残留的标的。
+    """
+    eng = engine or get_engine()
+    with eng.begin() as conn:
+        result = conn.execute(
+            text(
+                "DELETE FROM fund_positions "
+                "WHERE product_code = :p AND as_of_date = :d"
+            ),
+            {"p": product_code, "d": as_of_date},
+        )
+    return int(result.rowcount or 0)
+
+
 def upsert_product_valuation(df: pd.DataFrame, *, engine: Engine | None = None) -> int:
     """写入产品级净值/规模。主键 (as_of_date, product_code)。"""
     eng = engine or get_engine()
@@ -447,6 +471,34 @@ def load_positions(
     return pd.read_sql(sql, eng, params=params)
 
 
+def list_position_products(engine: Engine | None = None) -> list[str]:
+    """fund_positions 中出现过的产品代码（升序）。"""
+    eng = engine or get_engine()
+    sql = text("SELECT DISTINCT product_code FROM fund_positions ORDER BY product_code")
+    with eng.connect() as conn:
+        return [row[0] for row in conn.execute(sql).fetchall()]
+
+
+def list_position_dates(
+    product_code: str | None = None,
+    *,
+    engine: Engine | None = None,
+) -> list[str]:
+    """fund_positions 的估值日列表（倒序）；可按产品筛选。"""
+    eng = engine or get_engine()
+    if product_code:
+        sql = text(
+            "SELECT DISTINCT as_of_date FROM fund_positions "
+            "WHERE product_code = :p ORDER BY as_of_date DESC"
+        )
+        params: dict[str, object] = {"p": product_code}
+    else:
+        sql = text("SELECT DISTINCT as_of_date FROM fund_positions ORDER BY as_of_date DESC")
+        params = {}
+    with eng.connect() as conn:
+        return [row[0] for row in conn.execute(sql, params).fetchall()]
+
+
 def load_product_valuation(
     *,
     as_of_date: str | None = None,
@@ -512,6 +564,7 @@ __all__ = [
     "insert_attachment",
     "upsert_raw_sheet_rows",
     "upsert_positions",
+    "delete_positions",
     "upsert_transactions",
     "upsert_product_valuation",
     "load_holdings",
@@ -522,6 +575,8 @@ __all__ = [
     "load_nav_asof",
     "list_nav_dates",
     "load_positions",
+    "list_position_products",
+    "list_position_dates",
     "load_transactions",
     "load_product_valuation",
     "load_raw_sheet_rows",

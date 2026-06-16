@@ -72,6 +72,7 @@ from fundadmin.portfolio.maintenance import (
     format_bytes,
     prune_inbox,
 )
+from fundadmin.portfolio.by_broker_email import send_by_broker_summary_email
 from fundadmin.portfolio.notifier import send_matrix_email
 from fundadmin.portfolio.viz import generate_portfolio_pie_chart
 from fundadmin.notifications.email import SmtpConfig
@@ -1438,13 +1439,22 @@ def _persist_curated_layer(
     *,
     effective_trade_date: date,
 ) -> None:
-    """核心结构层：写 product_valuation + fund_positions。入库失败仅告警。"""
+    """核心结构层：写 product_valuation + fund_positions（分券商）。入库失败仅告警。
+
+    fund_positions 按 (产品, 标的, 券商) 逐行落地：同一标的若同时在中金、中信持有，
+    各券商单独成行（broker 真实填充），不再跨券商折叠。写入前先删除该产品该估值日的
+    旧快照，保证重跑幂等、不与旧 broker='' 折叠行重复计数。
+    """
     from fundadmin.clients.config import NAME_TO_PRODCODE
-    from fundadmin.clients.store import upsert_positions, upsert_product_valuation
+    from fundadmin.clients.store import (
+        delete_positions,
+        upsert_positions,
+        upsert_product_valuation,
+    )
 
     as_of = effective_trade_date.isoformat()
     val_rows: list[dict[str, Any]] = []
-    pos_frames: list[pd.DataFrame] = []
+    pos_by_pcode: dict[str, list[pd.DataFrame]] = {}
 
     for r in results:
         pname = r.get("product_name", "")
@@ -1468,21 +1478,32 @@ def _persist_curated_layer(
             }
         )
 
-        holdings_raw = r.get("holdings_raw")
-        if holdings_raw is not None and not holdings_raw.empty:
-            h = holdings_raw.copy()
+        # 优先用分券商明细；旧 payload 无该键时回退到合并视图（broker 落为 ''）。
+        positions = r.get("holdings_by_broker")
+        if positions is None or getattr(positions, "empty", True):
+            positions = r.get("holdings_raw")
+        if positions is not None and not positions.empty:
+            h = positions.copy()
             h["as_of_date"] = as_of
             h["product_code"] = pcode
             h["product_name"] = pname
-            h = h.rename(columns={"company": "instrument_name", "shares": "quantity"})
-            pos_frames.append(h)
+            h = h.rename(
+                columns={
+                    "company": "instrument_name",
+                    "shares": "quantity",
+                    "source_files": "source_files",
+                }
+            )
+            pos_by_pcode.setdefault(pcode, []).append(h)
 
     try:
         n_val = upsert_product_valuation(pd.DataFrame(val_rows)) if val_rows else 0
-        n_pos = (
-            upsert_positions(pd.concat(pos_frames, ignore_index=True)) if pos_frames else 0
-        )
-        print(f"[OK] curated-layer: {n_val} valuation row(s), {n_pos} position row(s)")
+        n_pos = 0
+        for pcode, frames in pos_by_pcode.items():
+            # 先清旧快照再写新分券商行：重跑幂等，并清理已清仓的残留标的。
+            delete_positions(pcode, as_of)
+            n_pos += upsert_positions(pd.concat(frames, ignore_index=True))
+        print(f"[OK] curated-layer: {n_val} valuation row(s), {n_pos} position row(s, per-broker)")
     except Exception:
         logger.exception("curated-layer persistence failed")
 
@@ -1756,6 +1777,21 @@ def _build_product_reports_for_trade_date(
                 sent_count = sum(1 for result in results if result.get("product_name", "") not in excluded)
                 email_sent = True
                 print(f"[OK] matrix email ({sent_count} products) sent to: {', '.join(to_addrs)}")
+
+                # ---- 分券商组合持仓汇总邮件（同收件人/同 SMTP；失败仅告警，不影响主流程）----
+                try:
+                    bb_sent = send_by_broker_summary_email(
+                        results,
+                        trade_date=effective_trade_date,
+                        smtp_config=smtp,
+                        to_addrs=to_addrs,
+                    )
+                    if bb_sent:
+                        print(f"[OK] by-broker summary email sent to: {', '.join(to_addrs)}")
+                    else:
+                        print("[INFO] by-broker summary email skipped: no per-broker data")
+                except Exception:
+                    logger.exception("by-broker summary email failed")
 
             # ---- 客户净值通知（clients 表，企业邮箱 SMTP xuekun@hysttz.com）----
             if notify_clients:

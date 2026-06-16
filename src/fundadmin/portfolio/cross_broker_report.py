@@ -101,6 +101,11 @@ def _load_cicc_frames(paths: list[Path] | None) -> list[pd.DataFrame]:
                 frames.append(parse_swhysc_holdings(p))
         else:
             frames.append(parse_cicc_holdings(p))
+    # 来源券商标记：本 loader 产出的持仓统一归为中金（cicc）。
+    # 注：中信证券代发的 CICC 场外衍生品估值表（is_derivative 分支）经济上仍是
+    # CICC 场外互换，且仅在 CITIC Statement 缺失时才作为唯一来源，故同样记为 cicc。
+    for f in frames:
+        f["broker"] = "cicc"
     return frames
 
 
@@ -159,6 +164,9 @@ def _load_citic_frames(
         # 对于 CITIC Statement Excel，Underlying 在 "Underlying" sheet
         sheet = "Underlying" if up.suffix.lower() in {".xlsx", ".xlsm", ".xls"} else 0
         frames.append(parse_citic_underlying(up, fx, sheet=sheet))
+    # 来源券商标记：本 loader 产出的持仓统一归为中信（citic）。
+    for f in frames:
+        f["broker"] = "citic"
     return frames
 
 
@@ -170,6 +178,10 @@ def _load_valuation_frames(paths: list[Path] | None) -> list[pd.DataFrame]:
         if not p.exists():
             continue
         frames.append(parse_swhysc_holdings(p))
+    # 来源券商标记：产品估值表来源记为申万宏源（swhysc）。
+    # 若个别产品估值表实为其他托管方，可后续按文件名细分；不影响 cicc/citic 主场景。
+    for f in frames:
+        f["broker"] = "swhysc"
     return frames
 
 
@@ -339,6 +351,10 @@ def build_cross_broker_report(
             holdings[col] = None
     # 成本金额转数值，确保 groupby 求和正确（None/空值视为缺失）。
     holdings["cost_value_local"] = pd.to_numeric(holdings["cost_value_local"], errors="coerce")
+    # 来源券商列：loader 已打标；个别未标记的兜底为 unknown，确保分券商聚合不丢行。
+    if "broker" not in holdings.columns:
+        holdings["broker"] = "unknown"
+    holdings["broker"] = holdings["broker"].fillna("").astype(str).str.strip().replace("", "unknown")
 
     # 3. 按 ticker 合并
     # 先标准化 ticker（去掉交易所后缀，如 TSLA.US -> TSLA，0286.HK -> 0286），
@@ -402,8 +418,67 @@ def build_cross_broker_report(
     # 保留原始数值 DataFrame，供可视化和通知模块使用
     aggregated_raw = aggregated.copy()
 
+    # 4b. 分券商来源拆分：同一标的在不同券商各保留一行（如 Tesla 同时在中金、中信）。
+    #     总表 aggregated 仍是合并视图，分券商明细单独产出，互不影响。
+    by_broker = (
+        holdings.groupby(["group_key", "broker"], as_index=False)
+        .agg(
+            ticker=("ticker", "first"),
+            company=("company", "first"),
+            shares=("shares", "sum"),
+            market_value_cny=("market_value_cny", "sum"),
+            cost_value_local=("cost_value_local", "sum"),
+            cost_ccy=("cost_ccy", _first_non_null),
+            source_files=("source_file", lambda s: ",".join(s.drop_duplicates().tolist())),
+        )
+    )
+    # 中金持仓无原生成本：仅对 cicc 行用全历史成交流水按移动加权法回填（口径同总表）。
+    if cicc_cost:
+        for i in by_broker.index:
+            if by_broker.at[i, "broker"] != "cicc":
+                continue
+            cv = by_broker.at[i, "cost_value_local"]
+            if cv is not None and not (isinstance(cv, float) and pd.isna(cv)) and cv != 0:
+                continue
+            info = cicc_cost.get(clean_ticker(by_broker.at[i, "ticker"]))
+            if info:
+                by_broker.at[i, "cost_value_local"] = info["cost_value_local"]
+                by_broker.at[i, "cost_ccy"] = info["cost_ccy"]
+    by_broker["cost_price_local"] = by_broker.apply(_per_share_cost, axis=1)
+    if nav and nav > 0:
+        by_broker["weight"] = by_broker["market_value_cny"] / nav
+    else:
+        by_broker["weight"] = None
+    by_broker = by_broker.sort_values(
+        ["market_value_cny", "group_key"], ascending=[False, True], na_position="last"
+    ).reset_index(drop=True)
+    # 落库用规范化 ticker（= group_key）：同一标的在中金(AMZN.US)与中信(AMZN)原始代码不同，
+    # 必须归一才能在结构层/看板按标的跨券商归并。原始券商代码保留在 ticker_raw 供溯源。
+    by_broker["ticker_raw"] = by_broker["ticker"]
+    by_broker["ticker"] = by_broker["group_key"]
+    by_broker_raw = by_broker.copy()
+
+    # 给总表/holdings sheet 附一列"分券商股数"摘要（如 "中金:1,234;中信:567"），便于一眼看清来源。
+    _broker_cn = {"cicc": "中金", "citic": "中信", "swhysc": "申万宏源"}
+
+    def _fmt_shares(value: Any) -> str:
+        try:
+            return f"{int(round(float(value))):,}"
+        except (TypeError, ValueError):
+            return "0"
+
+    breakdown_map: dict[Any, str] = {}
+    for gk, grp in by_broker.groupby("group_key"):
+        parts = [
+            f"{_broker_cn.get(r['broker'], r['broker'] or '未知')}:{_fmt_shares(r['shares'])}"
+            for _, r in grp.sort_values("market_value_cny", ascending=False).iterrows()
+        ]
+        breakdown_map[gk] = ";".join(parts)
+    aggregated_raw["broker_breakdown"] = aggregated_raw["group_key"].map(breakdown_map)
+
     # 5. 格式化输出
     fmt = aggregated.copy()
+    fmt["broker_breakdown"] = fmt["group_key"].map(breakdown_map)
     fmt["shares"] = pd.to_numeric(fmt["shares"], errors="coerce").fillna(0).astype(int)
     fmt["market_value_cny"] = fmt["market_value_cny"].apply(
         lambda x: f"{x:,.2f}" if pd.notna(x) else ""
@@ -432,10 +507,26 @@ def build_cross_broker_report(
         ]
     )
 
+    # 分券商明细 sheet（人读友好）：券商中文名 + 股数取整 + 市值/权重格式化。
+    by_broker_fmt = by_broker.copy()
+    by_broker_fmt.insert(0, "broker_name", by_broker_fmt["broker"].map(lambda b: _broker_cn.get(b, b or "未知")))
+    by_broker_fmt["shares"] = pd.to_numeric(by_broker_fmt["shares"], errors="coerce").fillna(0).astype(int)
+    by_broker_fmt["market_value_cny"] = by_broker_fmt["market_value_cny"].apply(
+        lambda x: f"{x:,.2f}" if pd.notna(x) else ""
+    )
+    by_broker_fmt["weight"] = by_broker_fmt["weight"].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "")
+    by_broker_fmt["cost_price_local"] = by_broker_fmt["cost_price_local"].apply(
+        lambda x: f"{x:,.4f}" if pd.notna(x) else ""
+    )
+    by_broker_fmt = by_broker_fmt[
+        ["broker_name", "ticker", "ticker_raw", "company", "shares", "market_value_cny", "weight", "cost_price_local", "cost_ccy"]
+    ]
+
     _ensure_dir(out_xlsx.parent)
     with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
         summary.to_excel(writer, sheet_name="summary", index=False)
         fmt.to_excel(writer, sheet_name="holdings", index=False)
+        by_broker_fmt.to_excel(writer, sheet_name="by_broker", index=False)
         aggregated.to_excel(writer, sheet_name="holdings_raw", index=False)
 
     return {
@@ -447,6 +538,7 @@ def build_cross_broker_report(
         "total_holdings": int(aggregated["group_key"].nunique()),
         "total_market_value_cny": float(aggregated["market_value_cny"].sum()) if aggregated["market_value_cny"].notna().any() else None,
         "holdings_raw": aggregated_raw,
+        "holdings_by_broker": by_broker_raw,
     }
 
 
