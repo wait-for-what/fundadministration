@@ -40,6 +40,7 @@ import logging
 import re
 import shutil
 import ssl
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -371,6 +372,30 @@ def _imap_date(value: date) -> str:
     return value.strftime("%d-%b-%Y")
 
 
+_IMAP_INTERNALDATE_MON = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+
+
+def _parse_imap_internaldate(meta: bytes | str | None) -> date | None:
+    """从 FETCH 元信息里解析 INTERNALDATE 的日期部分（收件日）。
+
+    QQ/exmail 的 IMAP SEARCH 会忽略 SINCE/BEFORE 而返回整箱，因此需要在客户端
+    用 INTERNALDATE 自行按收件日筛选，避免把全箱历史都当成"当日"邮件抓下来。
+    """
+    if meta is None:
+        return None
+    text = meta.decode("ascii", "replace") if isinstance(meta, (bytes, bytearray)) else str(meta)
+    m = re.search(r'INTERNALDATE "(\d{1,2})-(\w{3})-(\d{4})', text)
+    if not m:
+        return None
+    try:
+        return date(int(m.group(3)), _IMAP_INTERNALDATE_MON.get(m.group(2), 1), int(m.group(1)))
+    except ValueError:
+        return None
+
+
 def _imap_search_with_fallback(
     client: imaplib.IMAP4,
     criteria: str,
@@ -569,7 +594,17 @@ def _fetch_excel_attachments_via_imap_with_state(
     skip_processed: bool = False,
     product_scope: bool = True,
     scope_from_products: bool = True,
+    recent_scan_limit: int = 0,
+    enforce_received_date: bool = False,
 ) -> EmailSyncResult:
+    """增量拉取目标收件日的附件。
+
+    full-access(全量)邮箱适配:
+    - recent_scan_limit>0 时只扫描最新的 N 封(按 seq 取尾部)，避免每次 peek 整箱
+      4 万+ 头导致缓慢与 QQ 掉线；最新 N 封覆盖最近若干周，足够日常增量。
+    - enforce_received_date=True 时按 INTERNALDATE 客户端筛收件日窗口[since, before)，
+      因为 QQ 的 SEARCH 会忽略 SINCE/BEFORE 返回整箱，否则会把全箱历史误当当日抓下。
+    """
     _ensure_dir(out_dir)
     state_path = Path(state_file) if state_file is not None else None
     state = _load_email_sync_state(state_path) if state_path is not None else {"version": 1, "processed_messages": {}}
@@ -578,20 +613,26 @@ def _fetch_excel_attachments_via_imap_with_state(
     keywords = [str(x or "").strip().lower() for x in (subject_keywords or []) if str(x or "").strip()]
 
     context = ssl.create_default_context()
-    client: imaplib.IMAP4
-    if imap.use_ssl:
-        client = imaplib.IMAP4_SSL(imap.host, int(imap.port), ssl_context=context)
-    else:
-        client = imaplib.IMAP4(imap.host, int(imap.port))
-    try:
-        client.login(imap.user, imap.password)
-        select_status, _ = client.select(imap.mailbox)
-        if select_status != "OK":
-            fallback = "收件箱" if imap.mailbox.upper() == "INBOX" else "INBOX"
-            select_status, _ = client.select(fallback)
-            if select_status != "OK":
-                raise RuntimeError(f"cannot select mailbox: {imap.mailbox} / {fallback}")
 
+    def _connect() -> imaplib.IMAP4:
+        """建立 IMAP 连接、登录并选中目标邮箱（含中文收件箱 fallback）。"""
+        if imap.use_ssl:
+            conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(imap.host, int(imap.port), ssl_context=context)
+        else:
+            conn = imaplib.IMAP4(imap.host, int(imap.port))
+        conn.login(imap.user, imap.password)
+        sel_status, _ = conn.select(imap.mailbox)
+        if sel_status != "OK":
+            fallback = "收件箱" if imap.mailbox.upper() == "INBOX" else "INBOX"
+            sel_status, _ = conn.select(fallback)
+            if sel_status != "OK":
+                raise RuntimeError(f"cannot select mailbox: {imap.mailbox} / {fallback}")
+        return conn
+
+    # 可变持有：fetch 中途若被服务端断连（exmail/QQ 大批量 FETCH 常见 socket EOF），
+    # 重连后替换此引用，保证后续命令落到新连接上。
+    client_box: list[imaplib.IMAP4] = [_connect()]
+    try:
         since = target_date
         before = target_date + timedelta(days=1)
         criteria = build_imap_search_criteria(
@@ -602,12 +643,15 @@ def _fetch_excel_attachments_via_imap_with_state(
             scope_from_products=scope_from_products,
         )
         ids = _imap_search_with_fallback(
-            client,
+            client_box[0],
             criteria,
             since=since,
             before=before,
             sender_tokens=sorted(allow_senders),
         )
+        # full-access 邮箱里 SEARCH 返回整箱，仅扫描最新 N 封(seq 升序，尾部最新)。
+        if recent_scan_limit and len(ids) > recent_scan_limit:
+            ids = ids[-recent_scan_limit:]
         if not ids:
             return EmailSyncResult(
                 trade_date=target_date,
@@ -619,13 +663,48 @@ def _fetch_excel_attachments_via_imap_with_state(
                 state_file=state_path,
             )
 
+        def _raw_fetch_with_retry(seq: str, spec: str, *, max_retries: int = 3) -> list:
+            """单次 FETCH，遇 abort/socket EOF 时退避重连后重试；返回原始 data 列表。"""
+            last_exc: Exception | None = None
+            for attempt in range(max_retries):
+                try:
+                    status, data = client_box[0].fetch(seq, spec)
+                    if status != "OK":
+                        return []
+                    return data or []
+                except (imaplib.IMAP4.abort, OSError) as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "IMAP fetch aborted (attempt %d/%d): %s; reconnecting",
+                        attempt + 1, max_retries, exc,
+                    )
+                    try:
+                        client_box[0].logout()
+                    except Exception:
+                        logger.debug("IMAP logout on dead connection failed", exc_info=True)
+                    time.sleep(min(2 ** attempt, 8))
+                    try:
+                        client_box[0] = _connect()
+                    except Exception:
+                        logger.warning("IMAP reconnect failed", exc_info=True)
+            raise last_exc if last_exc is not None else imaplib.IMAP4.abort("fetch failed")
+
         def _batch_fetch(client: imaplib.IMAP4, msg_ids: list[bytes], spec: str) -> dict[bytes, bytes]:
             if not msg_ids:
                 return {}
             seq = b",".join(msg_ids).decode("ascii")
-            status, data = client.fetch(seq, spec)
-            if status != "OK" or not data:
-                return {}
+            try:
+                data = _raw_fetch_with_retry(seq, spec)
+            except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError):
+                # 重试仍失败：二分拆批，隔离过大批量或单封问题邮件，避免整次同步崩溃。
+                if len(msg_ids) <= 1:
+                    logger.warning("IMAP fetch failed for single message, skipping: %r", msg_ids)
+                    return {}
+                mid = len(msg_ids) // 2
+                return {
+                    **_batch_fetch(client_box[0], msg_ids[:mid], spec),
+                    **_batch_fetch(client_box[0], msg_ids[mid:], spec),
+                }
             result: dict[bytes, bytes] = {}
             for item in data:
                 if not isinstance(item, tuple) or len(item) < 2:
@@ -642,13 +721,44 @@ def _fetch_excel_attachments_via_imap_with_state(
             payloads = _batch_fetch(client, msg_ids, "(RFC822)")
             return {mid: message_from_bytes(payload) for mid, payload in payloads.items()}
 
+        def _batch_peek_meta(msg_ids: list[bytes]) -> dict[bytes, tuple[date | None, bytes]]:
+            """批量 peek (INTERNALDATE + 头)，返回 mid -> (收件日, 头字节)；带重连/二分降批。"""
+            if not msg_ids:
+                return {}
+            seq = b",".join(msg_ids).decode("ascii")
+            try:
+                data = _raw_fetch_with_retry(seq, "(INTERNALDATE BODY.PEEK[HEADER])")
+            except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError):
+                if len(msg_ids) <= 1:
+                    return {}
+                mid = len(msg_ids) // 2
+                return {**_batch_peek_meta(msg_ids[:mid]), **_batch_peek_meta(msg_ids[mid:])}
+            out: dict[bytes, tuple[date | None, bytes]] = {}
+            for item in data:
+                if not isinstance(item, tuple) or len(item) < 2:
+                    continue
+                meta, payload = item[0], item[1]
+                if not isinstance(meta, (bytes, bytearray)) or not isinstance(payload, (bytes, bytearray)):
+                    continue
+                m = re.match(rb"^(\d+)", meta)
+                if m:
+                    out[m.group(1)] = (_parse_imap_internaldate(meta), bytes(payload))
+            return out
+
         matched_meta: dict[bytes, dict[str, str]] = {}
         skipped_messages = 0
+        # 表头用较大批，正文（含大附件）用较小批，降低单条命令体积以减少服务端断连。
         batch_size = 50
+        rfc822_batch_size = 20
         for i in range(0, len(ids), batch_size):
             batch = ids[i : i + batch_size]
-            headers = _batch_fetch(client, batch, "(BODY.PEEK[HEADER])")
-            for mid, header_bytes in headers.items():
+            headers = _batch_peek_meta(batch)
+            for mid, (received_date, header_bytes) in headers.items():
+                # full-access 邮箱: 按收件日客户端筛窗口，避免把全箱历史误当当日邮件抓取。
+                if enforce_received_date and not (
+                    received_date is not None and since <= received_date < before
+                ):
+                    continue
                 msg = message_from_bytes(header_bytes)
                 subject = _decode_email_header(msg.get("Subject"))
                 sender = _decode_email_header(msg.get("From"))
@@ -674,9 +784,9 @@ def _fetch_excel_attachments_via_imap_with_state(
         saved: list[Path] = []
         processed_count = 0
         matched_ids = list(matched_meta.keys())
-        for i in range(0, len(matched_ids), batch_size):
-            batch = matched_ids[i : i + batch_size]
-            full_msgs = _batch_fetch_rfc822(client, batch)
+        for i in range(0, len(matched_ids), rfc822_batch_size):
+            batch = matched_ids[i : i + rfc822_batch_size]
+            full_msgs = _batch_fetch_rfc822(client_box[0], batch)
             for mid, msg in full_msgs.items():
                 meta = matched_meta.get(mid)
                 if meta is None:
@@ -721,7 +831,7 @@ def _fetch_excel_attachments_via_imap_with_state(
         )
     finally:
         try:
-            client.logout()
+            client_box[0].logout()
         except Exception:
             # IMAP logout 失败仅记录，不影响调用方主流程。
             logger.debug("IMAP client.logout() failed", exc_info=True)
@@ -1329,6 +1439,10 @@ def _run_email_sync_for_trade_date(
         skip_processed=skip_processed,
         product_scope=bool(getattr(args, "product_scope", True)),
         scope_from_products=bool(getattr(args, "scope_from_products", True)),
+        # full-access 邮箱适配: 只扫最新若干封 + 客户端按收件日筛，避免拉全箱历史/掉线。
+        # 2000 封约覆盖最近 20 天收件(~100/日)，足够日常增量与 10 天补发窗口。
+        recent_scan_limit=int(getattr(args, "recent_scan_limit", 2000) or 2000),
+        enforce_received_date=bool(getattr(args, "enforce_received_date", True)),
     )
 
 
@@ -2016,15 +2130,24 @@ def _cmd_sync_latest(args: argparse.Namespace) -> int:
     # ---- 下载段：按收件日窗口拉取附件进 inbox/<收件日>/（IMAP 仅能按收件日检索）----
     total_saved = 0
     total_skipped = 0
+    download_failures = 0
     for received_date in resolved_dates:
         out_dir = inbox_root / received_date.isoformat()
-        result = _run_email_sync_for_trade_date(
-            trade_date=received_date,
-            args=args,
-            out_dir=out_dir,
-            skip_processed=bool(getattr(args, "skip_processed", True)),
-            state_file=state_file,
-        )
+        # 单个收件日的 IMAP 失败（如服务端断连）不应拖垮整次同步：
+        # 记录告警后继续，使发布段仍能用已下载到本地的文件发出已补齐的交易日。
+        try:
+            result = _run_email_sync_for_trade_date(
+                trade_date=received_date,
+                args=args,
+                out_dir=out_dir,
+                skip_processed=bool(getattr(args, "skip_processed", True)),
+                state_file=state_file,
+            )
+        except Exception:
+            download_failures += 1
+            logger.exception("email sync failed for received_date %s", received_date.isoformat())
+            print(f"[WARN] sync failed for {received_date.isoformat()}; continuing with already-downloaded files")
+            continue
         total_saved += len(result.saved_paths)
         total_skipped += int(result.skipped_messages)
         print(
@@ -2095,11 +2218,16 @@ def _cmd_sync_latest(args: argparse.Namespace) -> int:
 
     print(
         f"[OK] sync-latest finished: received_dates={len(resolved_dates)}, "
+        f"download_failures={download_failures}, "
         f"saved_attachments={total_saved}, skipped_messages={total_skipped}, "
         f"built_reports={built_reports}, matrix_sent={matrix_sent}, clients_sent={clients_sent}"
     )
     if state_file is not None:
         print(f"state_file: {state_file}")
+    # 仅当所有收件日下载都失败（彻底没拉到任何数据）才以非零退出，提示运维介入；
+    # 部分失败但仍完成构建/发送时视为成功，避免 launchd 误报。
+    if download_failures and download_failures == len(resolved_dates):
+        return 1
     return 0
 
 
