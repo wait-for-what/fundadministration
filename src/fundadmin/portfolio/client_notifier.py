@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import html
 import warnings
 from datetime import date
 from pathlib import Path
@@ -99,7 +100,8 @@ def _build_client_html(
     total_mv: float = 0.0
 
     for h in holdings:
-        pname = h["product_name"]
+        # 产品名来自配置/客户表，转义后再注入 HTML，杜绝邮件正文注入（security-3）。
+        pname = html.escape(str(h["product_name"]))
         unit_nav = h.get("unit_nav")
         shares = h.get("shares")
 
@@ -140,7 +142,7 @@ td {{ padding: 8px 12px; border: 1px solid #ddd; }}
 </head>
 <body>
 <h2>📊 弘运盛泰产品净值通知 — {trade_date.isoformat()}</h2>
-<p>尊敬的 <strong>{custname}</strong>：</p>
+<p>尊敬的 <strong>{html.escape(str(custname))}</strong>：</p>
 <p>您持有的产品净值信息如下：</p>
 <table>
 <thead>
@@ -191,10 +193,32 @@ def send_client_nav_emails(
 
     nav_map = load_nav_map(summary_xlsx)
 
-    # 按客户分组
+    # 按客户分组。区分两类未送达（notifications-4）：
+    #   skipped — 无 email / 无可展示持仓：本就不可送达，不应触发重试。
+    #   failed  — 实际发送时抛异常（SMTP 故障等）：应在下次运行重试，故不能算作"已发布"。
     sent = 0
     skipped = 0
+    failed = 0
+    ambiguous = 0
+    failed_clients: list[str] = []
+    ambiguous_clients: list[str] = []
     for custname, group in clients.groupby("custname"):
+        # 客户隔离断言（clients-store-1 / notifications-3）：clients 主键是 (custname, prodcode)，
+        # custname 不是唯一身份键。若同名分组下出现多个不同邮箱，无法确定唯一收件人——
+        # 宁可跳过+告警，也绝不把甲的持仓汇总发给乙。真正的修复是引入稳定 client_id（已登记后续任务）。
+        distinct_emails = {
+            e for e in group["email"].dropna().astype(str).map(str.strip) if e and "@" in e
+        }
+        if len(distinct_emails) > 1:
+            warnings.warn(
+                f"客户 {custname} 存在多个不同邮箱 {sorted(distinct_emails)}，身份歧义，"
+                "跳过以防跨客户泄露",
+                stacklevel=2,
+            )
+            ambiguous += 1
+            ambiguous_clients.append(str(custname))
+            continue
+
         email = group["email"].iloc[0]
         if not email or "@" not in email:
             skipped += 1
@@ -231,6 +255,17 @@ def send_client_nav_emails(
             print(f"[OK] Sent to {custname} ({email})")
         except Exception as exc:
             warnings.warn(f"Email send failed for {custname}: {exc}", stacklevel=2)
-            skipped += 1
+            failed += 1
+            failed_clients.append(str(custname))
 
-    return {"sent": sent, "skipped": skipped, "total": len(clients.groupby("custname").size())}
+    eligible = sent + failed  # 有 email 且有持仓、确实尝试发送的客户数
+    return {
+        "sent": sent,
+        "skipped": skipped,
+        "failed": failed,
+        "ambiguous": ambiguous,
+        "eligible": eligible,
+        "failed_clients": failed_clients,
+        "ambiguous_clients": ambiguous_clients,
+        "total": len(clients.groupby("custname").size()),
+    }

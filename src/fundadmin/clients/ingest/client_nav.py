@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 from pathlib import Path
 
@@ -29,6 +30,8 @@ from fundadmin.portfolio.parsers.common import read_csv_robust
 
 from ..config import PRODCODE_TO_NAME
 from ..store import upsert_clients, upsert_nav
+
+logger = logging.getLogger(__name__)
 
 _NAME_TO_PRODCODE: dict[str, str] = {v: k for k, v in PRODCODE_TO_NAME.items()}
 
@@ -63,6 +66,12 @@ def import_clients_csv(csv_path: str | Path, *, engine: Engine | None = None) ->
         return 0
 
     df["holding_shares"] = pd.to_numeric(df["holding_shares"], errors="coerce")
+    n_bad_shares = int(df["holding_shares"].isna().sum())
+    if n_bad_shares:
+        logger.warning(
+            "import_clients_csv(%s): %d 行 holding_shares 非数值/缺失，将以空值入库（clients-store-6）",
+            path.name, n_bad_shares,
+        )
     df["active"] = pd.to_numeric(df["active"], errors="coerce").fillna(1).astype(int)
     df["prodname"] = df["prodname"].where(
         df["prodname"].astype(str).str.strip().ne("") & df["prodname"].notna(),
@@ -107,9 +116,13 @@ def import_nav_xlsx(
 
     if "nav_unit" not in df.columns:
         raise ValueError("Excel 缺少 nav_unit / unit_nav 列")
+    n_in = len(df)
     if "as_of_date" not in df.columns:
         df["as_of_date"] = as_of_date or _infer_date_from_filename(path) or date.today().isoformat()
-    df["as_of_date"] = df["as_of_date"].apply(lambda v: pd.to_datetime(v).date().isoformat())
+    # 逐行容错解析日期：单个坏值不应抛异常中断整批导入（clients-store-5）。
+    parsed = pd.to_datetime(df["as_of_date"], errors="coerce")
+    bad_dates = int(parsed.isna().sum())
+    df["as_of_date"] = parsed.dt.date.map(lambda d: d.isoformat() if pd.notna(d) else None)
     df["nav_unit"] = pd.to_numeric(df["nav_unit"], errors="coerce")
     if "nav_cum" in df.columns:
         df["nav_cum"] = pd.to_numeric(df["nav_cum"], errors="coerce")
@@ -117,7 +130,15 @@ def import_nav_xlsx(
         df["nav_cum"] = None
     df["src_xlsx"] = path.name
 
-    df = df[df["nav_unit"].notna()]
+    # 丢弃日期不可解析或单位净值缺失的行，但把丢弃数量显式上报，避免静默丢数（clients-store-6）。
+    before = len(df)
+    df = df[df["as_of_date"].notna() & df["nav_unit"].notna()]
+    dropped = before - len(df)
+    if dropped:
+        logger.warning(
+            "import_nav_xlsx(%s): 丢弃 %d/%d 行（日期不可解析 %d 行，其余为单位净值缺失/非数值）",
+            path.name, dropped, n_in, bad_dates,
+        )
     if df.empty:
         return 0
 

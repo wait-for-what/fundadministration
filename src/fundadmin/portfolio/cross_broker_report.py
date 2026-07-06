@@ -28,6 +28,10 @@ from fundadmin.portfolio.parsers.citic import (
     parse_citic_underlying,
     parse_citics_derivative_holdings,
 )
+from fundadmin.portfolio.parsers.citic_assoc import (
+    is_citic_assoc_report,
+    parse_citic_assoc_holdings,
+)
 from fundadmin.portfolio.parsers.common import clean_ticker
 from fundadmin.portfolio.parsers.swhysc import (
     parse_swhysc_holdings,
@@ -52,6 +56,7 @@ class CrossBrokerInput:
     citic_usd_balance_paths: list[Path] | None = None
     citic_hkd_underlying_paths: list[Path] | None = None
     citic_hkd_balance_paths: list[Path] | None = None
+    citic_assoc_paths: list[Path] | None = None
     valuation_paths: list[Path] | None = None
 
 
@@ -66,47 +71,70 @@ def _load_cicc_frames(paths: list[Path] | None) -> list[pd.DataFrame]:
     for p in paths:
         if not p.exists():
             continue
-        suffix = p.suffix.lower()
-        if suffix == ".xls":
-            # CICC .xls 估值表（如 SCD704/SNJ280）中的 3199 科目是收益互换会计记录，
-            # 属于衍生品合约层面，并非底层个股持仓，不纳入合并。
+        try:
+            frame = _load_one_cicc_frame(p)
+        except Exception:
+            # 单个文件格式异常（如券商改版下发未知模板）不应中止整个产品构建。
+            # 记 warning 让运维可见，跳过该文件，其余来源继续合并（reconcile-xbroker-2）。
+            logger.warning("CICC 持仓文件解析失败，跳过: %s", p, exc_info=True)
             continue
-        elif suffix == ".xlsx":
-            # 中信证券代发的 CICC 场外衍生品估值表有 3 个 sheet（含 "互换标的信息"），
-            # 与标准估值表格式（1 个 sheet）区分。
-            # CICC 估值报告附件（如 2026-04-16弘运盛泰铂金2号私募证券投资基金.xlsx）
-            # 含 "持仓" sheet，需单独解析。
-            try:
-                xl = pd.ExcelFile(p)
-                sheet_names = xl.sheet_names
-                is_derivative = len(sheet_names) == 3
-                has_holdings_sheet = "持仓" in sheet_names
-            except Exception:
-                is_derivative = False
-                has_holdings_sheet = False
-
-            if is_derivative:
-                try:
-                    frames.append(parse_citics_derivative_holdings(p))
-                except Exception:
-                    # 如果解析失败（如 sheet 为空），回退到标准估值表解析
-                    frames.append(parse_swhysc_holdings(p))
-            elif has_holdings_sheet:
-                try:
-                    frames.append(parse_cicc_valuation_xlsx_holdings(p))
-                except Exception:
-                    frames.append(parse_swhysc_holdings(p))
-            else:
-                # CICC 的 .xlsx 估值表（如 SLL384/SXQ602/SQJ420 等）使用与申万相同的格式
-                frames.append(parse_swhysc_holdings(p))
-        else:
-            frames.append(parse_cicc_holdings(p))
+        if frame is not None:
+            frames.append(frame)
     # 来源券商标记：本 loader 产出的持仓统一归为中金（cicc）。
     # 注：中信证券代发的 CICC 场外衍生品估值表（is_derivative 分支）经济上仍是
     # CICC 场外互换，且仅在 CITIC Statement 缺失时才作为唯一来源，故同样记为 cicc。
     for f in frames:
         f["broker"] = "cicc"
     return frames
+
+
+def _load_one_cicc_frame(p: Path) -> pd.DataFrame | None:
+    """解析单个 CICC 持仓文件，按格式分派。返回 None 表示该文件不含可用持仓。"""
+    suffix = p.suffix.lower()
+    if suffix == ".xls":
+        # CICC .xls 估值表（如 SCD704/SNJ280）中的 3199 科目是收益互换会计记录，
+        # 属于衍生品合约层面，并非底层个股持仓，不纳入合并。
+        return None
+    if suffix != ".xlsx":
+        return parse_cicc_holdings(p)
+
+    # 中信证券代发的 CICC 场外衍生品估值表有 3 个 sheet（含 "互换标的信息"），
+    # 与标准估值表格式（1 个 sheet）区分。
+    # CICC 估值报告附件（如 2026-04-16弘运盛泰铂金2号私募证券投资基金.xlsx）
+    # 含 "持仓" sheet，需单独解析。
+    try:
+        sheet_names = pd.ExcelFile(p).sheet_names
+        is_derivative = len(sheet_names) == 3
+        has_holdings_sheet = "持仓" in sheet_names
+    except Exception:
+        is_derivative = False
+        has_holdings_sheet = False
+
+    if is_derivative:
+        try:
+            return parse_citics_derivative_holdings(p)
+        except Exception:
+            # 如果解析失败（如 sheet 为空），回退到标准估值表解析
+            return parse_swhysc_holdings(p)
+    if has_holdings_sheet:
+        try:
+            return parse_cicc_valuation_xlsx_holdings(p)
+        except Exception:
+            return parse_swhysc_holdings(p)
+    # CICC 的 .xlsx 估值表（如 SLL384/SXQ602/SQJ420 等）使用与申万相同的格式
+    return parse_swhysc_holdings(p)
+
+
+_FX_CCY_TOKENS = ("USD", "HKD", "CNH", "CNY", "EUR", "GBP", "JPY", "AUD", "SGD")
+
+
+def _currency_token(stem: str) -> str | None:
+    """从文件名提取币种 token（USD/HKD/...），用于 Balance↔Underlying 精确配对（FX gap）。"""
+    s = str(stem).upper()
+    for ccy in _FX_CCY_TOKENS:
+        if ccy in s:
+            return ccy
+    return None
 
 
 def _load_citic_frames(
@@ -142,24 +170,31 @@ def _load_citic_frames(
 
         fx: float | None = global_fx
         if fx is None:
-            # 按文件名相似度或同目录匹配
             up_stem = up.stem.lower()
             up_dir = up.parent
-            for bp_stem, rate in fx_map.items():
-                bp = next((p for p in balance_paths if p.stem == bp_stem), None)
-                if bp is None:
-                    continue
-                # 同目录优先
-                if bp.parent == up_dir:
-                    fx = rate
-                    break
-                # 或文件名包含关系
-                if bp_stem.lower() in up_stem or up_stem in bp_stem.lower():
-                    fx = rate
-                    break
+            up_ccy = _currency_token(up.stem)
+            # 第一优先：币种 token 精确配对。每日 inbox 把 USD/HKD 文件都堆在同一目录，
+            # 原先的"同目录优先 / 文件名包含"会把 USD 标的配上 HKD 汇率，静默算错市值（FX gap）。
+            if up_ccy is not None:
+                for bp_stem, rate in fx_map.items():
+                    if _currency_token(bp_stem) == up_ccy:
+                        fx = rate
+                        break
+            if fx is None and up_ccy is None:
+                # 仅当文件名无币种 token 时，才回退到同目录 / 包含关系的旧匹配。
+                for bp_stem, rate in fx_map.items():
+                    bp = next((p for p in balance_paths if p.stem == bp_stem), None)
+                    if bp is None:
+                        continue
+                    if bp.parent == up_dir:
+                        fx = rate
+                        break
+                    if bp_stem.lower() in up_stem or up_stem in bp_stem.lower():
+                        fx = rate
+                        break
 
         if fx is None:
-            raise ValueError(f"无法为 {up} 找到匹配的 Balance/汇率文件")
+            raise ValueError(f"无法为 {up} 找到匹配的 Balance/汇率文件（币种 token={_currency_token(up.stem)}）")
 
         # 对于 CITIC Statement Excel，Underlying 在 "Underlying" sheet
         sheet = "Underlying" if up.suffix.lower() in {".xlsx", ".xlsm", ".xls"} else 0
@@ -182,6 +217,29 @@ def _load_valuation_frames(paths: list[Path] | None) -> list[pd.DataFrame]:
     # 若个别产品估值表实为其他托管方，可后续按文件名细分；不影响 cicc/citic 主场景。
     for f in frames:
         f["broker"] = "swhysc"
+    return frames
+
+
+def _load_citic_assoc_frames(paths: list[Path] | None) -> list[pd.DataFrame]:
+    """加载中信收益互换协会版本估值报告（「存续标的汇总」）持仓，标记 broker=citic。
+
+    单文件解析异常不中止整批：记 warning 并跳过，避免券商改版导致整个产品构建失败。
+    """
+    if not paths:
+        return []
+    frames: list[pd.DataFrame] = []
+    for p in paths:
+        if not p.exists():
+            continue
+        try:
+            frame = parse_citic_assoc_holdings(p)
+        except Exception:
+            logger.warning("中信协会版本估值表解析失败，跳过: %s", p, exc_info=True)
+            continue
+        if not frame.empty:
+            frames.append(frame)
+    for f in frames:
+        f["broker"] = "citic"
     return frames
 
 
@@ -311,10 +369,20 @@ def build_cross_broker_report(
     nav = asset_nav if asset_nav is not None else unit_nav
 
     # 2. 加载各账户持仓
-    # CITIC Statement 和 CICC 场外衍生品估值表中的 "互换标的信息" 是同一批底层持仓的
-    # 不同表示（前者是汇总视图，后者是合约级视图），避免重复计算。
-    citic_frames = _load_citic_frames(inputs.citic_usd_underlying_paths, inputs.citic_usd_balance_paths)
-    citic_frames += _load_citic_frames(inputs.citic_hkd_underlying_paths, inputs.citic_hkd_balance_paths)
+    # 中信收益互换协会版本估值报告（「存续标的汇总」）单文件覆盖该互换全部币种（USD+HKD），
+    # 是旧逐币种 Statement（履约保障）的超集。协会版本存在时，作为中信唯一持仓来源，
+    # 抑制 Statement，避免同一标的重复计算（assoc 与 Statement 的 USD 标的市值已逐一核对一致）。
+    citic_assoc_frames = _load_citic_assoc_frames(inputs.citic_assoc_paths)
+    has_assoc_holdings = any(not f.empty for f in citic_assoc_frames)
+
+    if has_assoc_holdings:
+        citic_frames: list[pd.DataFrame] = []
+    else:
+        # CITIC Statement 和 CICC 场外衍生品估值表中的 "互换标的信息" 是同一批底层持仓的
+        # 不同表示（前者是汇总视图，后者是合约级视图），避免重复计算。
+        citic_frames = _load_citic_frames(inputs.citic_usd_underlying_paths, inputs.citic_usd_balance_paths)
+        citic_frames += _load_citic_frames(inputs.citic_hkd_underlying_paths, inputs.citic_hkd_balance_paths)
+    citic_frames += citic_assoc_frames
     has_citic_holdings = any(not f.empty for f in citic_frames)
 
     cicc_paths = inputs.cicc_paths or []
@@ -594,6 +662,7 @@ def _match_files_for_product(
     citic_usd_b: list[Path] = []
     citic_hkd_u: list[Path] = []
     citic_hkd_b: list[Path] = []
+    citic_assoc: list[Path] = []
     cicc_paths: list[Path] = []
     valuation_paths_matched: list[Path] = []
 
@@ -601,6 +670,12 @@ def _match_files_for_product(
         name = f.name
         if not _is_target_date(name, trade_date):
             continue
+
+        # 中信收益互换"协会版本"估值报告（多 sheet，含「存续标的汇总」）。
+        # 单独成路由，避免误入 cicc_paths 触发申万解析器崩溃（旧 bug：整产品构建中止）。
+        is_assoc = "协会版本" in name or "收益互换估值报告" in name
+        # 中信"收益互换指标计算结果"是指标/估值汇总文件，非底层持仓，既不入 cicc 也不入 assoc。
+        is_metrics = "指标计算" in name
 
         # CITIC
         for code in cfg.get("citic_codes", []):
@@ -611,19 +686,30 @@ def _match_files_for_product(
                 elif "HKD" in name:
                     citic_hkd_u.append(f)
                     citic_hkd_b.append(f)
+            elif code in name and is_assoc and f.suffix.lower() in {".xlsx", ".xlsm"} and f not in citic_assoc:
+                citic_assoc.append(f)
 
         # CICC 估值表（.xls 收益互换科目 或 .xlsx 标准估值表格式）
         for code in cfg.get("cicc_codes", []):
             if code in name and f.suffix.lower() in {".xls", ".xlsx"} and "Statement" not in name:
                 cicc_paths.append(f)
 
-        # 中信证券代发的 CICC 场外衍生品估值表（文件名含 citic_codes 如 104902/111255 等）
+        # 中信证券代发的 CICC 场外衍生品估值表（文件名含 citic_codes 如 104902/111255 等）。
+        # 排除协会版本（走 citic_assoc）与指标计算结果（非持仓），二者均非 CICC 衍生品表。
         for code in cfg.get("citic_codes", []):
-            if code in name and f.suffix.lower() == ".xlsx" and "Statement" not in name and f not in cicc_paths:
+            if (
+                code in name and f.suffix.lower() == ".xlsx" and "Statement" not in name
+                and not is_assoc and not is_metrics and f not in cicc_paths
+            ):
                 cicc_paths.append(f)
 
-        # CICC 估值报告附件（文件名格式：{date}弘运盛泰{product_name}私募证券投资基金.xlsx）
-        if cfg["name"] in name and "弘运盛泰" in name and f.suffix.lower() == ".xlsx" and "Statement" not in name and f not in cicc_paths and f not in valuation_paths_matched:
+        # CICC 估值报告附件（文件名格式：{date}弘运盛泰{product_name}私募证券投资基金.xlsx）。
+        # 协会版本/指标计算文件名也含"弘运盛泰{产品名}"，必须排除，否则又落回 cicc_paths。
+        if (
+            cfg["name"] in name and "弘运盛泰" in name and f.suffix.lower() == ".xlsx"
+            and "Statement" not in name and not is_assoc and not is_metrics
+            and f not in cicc_paths and f not in valuation_paths_matched
+        ):
             cicc_paths.append(f)
 
         # 产品估值表（文件名包含关键词且为 xlsx）
@@ -647,6 +733,7 @@ def _match_files_for_product(
         citic_usd_balance_paths=citic_usd_b or None,
         citic_hkd_underlying_paths=citic_hkd_u or None,
         citic_hkd_balance_paths=citic_hkd_b or None,
+        citic_assoc_paths=sorted(set(citic_assoc)) or None,
         valuation_paths=valid_valuation or None,
     )
 
@@ -664,6 +751,7 @@ def score_product_inputs_for_date(files: list[Path], trade_date: date) -> tuple[
             bool(inputs.cicc_paths),
             bool(inputs.citic_usd_underlying_paths),
             bool(inputs.citic_hkd_underlying_paths),
+            bool(inputs.citic_assoc_paths),
             bool(inputs.valuation_paths),
         ]
         if any(source_flags):
@@ -704,6 +792,7 @@ def build_product_reports(
             inputs.cicc_paths,
             inputs.citic_usd_underlying_paths,
             inputs.citic_hkd_underlying_paths,
+            inputs.citic_assoc_paths,
             inputs.valuation_paths,
         ])
         if not has_input:
@@ -724,7 +813,13 @@ def build_product_reports(
             if "未找到任何有效持仓数据" in str(exc):
                 logger.warning("%s: 未找到有效持仓数据，跳过", pname)
                 continue
-            raise
+            # 单产品的输入/解析错误（缺列、缺 Balance/汇率文件等）不应阻断其它产品的构建
+            # （reconcile-xbroker-2）。记 ERROR 让运维可见，并继续下一个产品。
+            logger.error("%s: 构建失败，跳过该产品: %s", pname, exc)
+            continue
+        except Exception as exc:  # noqa: BLE001 - 防止单产品异常阻断整批构建
+            logger.error("%s: 构建时发生未预期异常，跳过该产品: %s", pname, exc)
+            continue
 
     return results
 

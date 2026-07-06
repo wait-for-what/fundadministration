@@ -19,11 +19,11 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import pandas as pd
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from .schema import get_engine
 
@@ -156,12 +156,10 @@ def _normalize(df: pd.DataFrame, cols: Sequence[str], *, defaults: Mapping[str, 
     return out[list(cols)]
 
 
-def _upsert(engine: Engine, table: str, cols: Sequence[str], pk_cols: Sequence[str], df: pd.DataFrame) -> int:
-    """通用 SQLite UPSERT。
-
-    - SQLite 3.24+ 支持 ON CONFLICT DO UPDATE；本仓库环境（Python 3.10+）默认满足。
-    - DataFrame 行通过 executemany 一次提交，保留事务原子性。
-    """
+def _upsert_conn(
+    conn: Connection, table: str, cols: Sequence[str], pk_cols: Sequence[str], df: pd.DataFrame
+) -> int:
+    """在给定连接/事务内执行 UPSERT（供需要与其它写操作共享事务的调用方使用）。"""
     if df.empty:
         return 0
 
@@ -176,9 +174,20 @@ def _upsert(engine: Engine, table: str, cols: Sequence[str], pk_cols: Sequence[s
     )
 
     rows = df.where(pd.notna(df), None).to_dict(orient="records")
-    with engine.begin() as conn:
-        conn.execute(sql, rows)
+    conn.execute(sql, rows)
     return len(rows)
+
+
+def _upsert(engine: Engine, table: str, cols: Sequence[str], pk_cols: Sequence[str], df: pd.DataFrame) -> int:
+    """通用 SQLite UPSERT。
+
+    - SQLite 3.24+ 支持 ON CONFLICT DO UPDATE；本仓库环境（Python 3.10+）默认满足。
+    - DataFrame 行通过 executemany 一次提交，保留事务原子性。
+    """
+    if df.empty:
+        return 0
+    with engine.begin() as conn:
+        return _upsert_conn(conn, table, cols, pk_cols, df)
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +278,57 @@ def upsert_raw_sheet_rows(df: pd.DataFrame, *, engine: Engine | None = None) -> 
     )
 
 
+def insert_attachment_with_rows(
+    meta: Mapping[str, object],
+    build_rows: Callable[[int], pd.DataFrame],
+    *,
+    engine: Engine | None = None,
+) -> tuple[int, bool, int]:
+    """在单个事务内登记附件并写入其原始行，消除"孤儿附件"。
+
+    历史实现先在一个事务提交 attachment_ingest（含 sha256），再在另一个事务写
+    raw_sheet_rows；若两步之间崩溃，sha256 已登记但原始行为空，下次重投递因
+    is_new=False 永久跳过、原始行永远补不回来（raw-ingest gap）。本函数把"登记 +
+    写行"放进同一事务：写行失败则整体回滚，sha256 不会落库，可重新入库。
+
+    build_rows(ingest_id) 在事务内调用以构造原始行 DataFrame（行内含该 ingest_id）。
+    返回 (ingest_id, is_new, n_rows)；已存在则 (旧 id, False, 0)。
+    """
+    eng = engine or get_engine()
+    sha = str(meta.get("sha256") or "").strip()
+    if not sha:
+        raise ValueError("insert_attachment_with_rows: sha256 is empty")
+
+    with eng.begin() as conn:
+        existing = conn.execute(
+            text("SELECT ingest_id FROM attachment_ingest WHERE sha256 = :s"),
+            {"s": sha},
+        ).fetchone()
+        if existing is not None:
+            return int(existing[0]), False, 0
+
+        cols_sql = ", ".join(_ATTACHMENT_COLS)
+        placeholders = ", ".join(f":{c}" for c in _ATTACHMENT_COLS)
+        params = {c: meta.get(c) for c in _ATTACHMENT_COLS}
+        result = conn.execute(
+            text(f"INSERT INTO attachment_ingest ({cols_sql}) VALUES ({placeholders})"),
+            params,
+        )
+        new_id = int(result.lastrowid)
+
+        rows_df = build_rows(new_id)
+        n_rows = 0
+        if rows_df is not None and not rows_df.empty:
+            n_rows = _upsert_conn(
+                conn,
+                "raw_sheet_rows",
+                _RAW_ROW_COLS,
+                ("ingest_id", "sheet_index", "row_index"),
+                _normalize(rows_df, _RAW_ROW_COLS),
+            )
+    return new_id, True, n_rows
+
+
 # ---------------------------------------------------------------------------
 # 附件入库：核心结构层
 # ---------------------------------------------------------------------------
@@ -356,6 +416,38 @@ def delete_positions(
             {"p": product_code, "d": as_of_date},
         )
     return int(result.rowcount or 0)
+
+
+def replace_positions(
+    product_code: str,
+    as_of_date: str,
+    df: pd.DataFrame,
+    *,
+    engine: Engine | None = None,
+) -> int:
+    """单事务内先删旧快照再写新分券商行，返回写入行数。
+
+    分券商重建若用"delete 提交 + upsert 另一事务"，删后写失败会留下空/半快照，
+    且故障被吞，看板/对账读到空持仓而邮件照发（clients-store-3 / ops-sync-11）。
+    本函数把删除与写入放进同一事务：写入失败整体回滚到删除前的旧快照，
+    任何时刻该 (product_code, as_of_date) 快照都不会被观察到为空。
+    """
+    eng = engine or get_engine()
+    payload = _normalize(df, _POSITION_COLS, defaults={"broker": "", "contract_no": ""})
+    for col in ("broker", "ticker", "instrument_name", "contract_no"):
+        payload[col] = payload[col].fillna("").astype(str)
+    with eng.begin() as conn:
+        conn.execute(
+            text("DELETE FROM fund_positions WHERE product_code = :p AND as_of_date = :d"),
+            {"p": product_code, "d": as_of_date},
+        )
+        return _upsert_conn(
+            conn,
+            "fund_positions",
+            _POSITION_COLS,
+            ("as_of_date", "product_code", "broker", "ticker", "instrument_name", "contract_no"),
+            payload,
+        )
 
 
 def upsert_product_valuation(df: pd.DataFrame, *, engine: Engine | None = None) -> int:
@@ -562,9 +654,11 @@ __all__ = [
     "upsert_clients",
     "upsert_nav",
     "insert_attachment",
+    "insert_attachment_with_rows",
     "upsert_raw_sheet_rows",
     "upsert_positions",
     "delete_positions",
+    "replace_positions",
     "upsert_transactions",
     "upsert_product_valuation",
     "load_holdings",

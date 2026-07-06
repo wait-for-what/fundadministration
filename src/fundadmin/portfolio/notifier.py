@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import html
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,7 @@ def build_email_html(
     rows: list[str] = []
     for r in results:
         pname = r.get("product_name", "")
+        pname_disp = html.escape(str(pname))
         unit_nav = r.get("unit_nav")
         asset_nav = r.get("asset_nav")
         nav = r.get("nav")
@@ -68,7 +70,7 @@ def build_email_html(
 
         rows.append(
             f"<tr>"
-            f"<td style='padding:8px 12px;border:1px solid #ddd;'>{pname}</td>"
+            f"<td style='padding:8px 12px;border:1px solid #ddd;'>{pname_disp}</td>"
             f"<td style='padding:8px 12px;border:1px solid #ddd;text-align:right;'>{unit_nav_str}</td>"
             f"<td style='padding:8px 12px;border:1px solid #ddd;text-align:right;'>{asset_nav_str}</td>"
             f"<td style='padding:8px 12px;border:1px solid #ddd;text-align:right;'>{nav_str}</td>"
@@ -88,7 +90,7 @@ def build_email_html(
             cid = f"chart_{_safe_cid(pname)}"
             chart_sections.append(
                 f"<div style='margin:24px 0;text-align:center;'>"
-                f"<h3 style='font-size:14px;color:#333;margin-bottom:8px;'>{pname}</h3>"
+                f"<h3 style='font-size:14px;color:#333;margin-bottom:8px;'>{html.escape(str(pname))}</h3>"
                 f"<img src='cid:{cid}' style='max-width:600px;width:100%;height:auto;border:1px solid #eee;border-radius:4px;' />"
                 f"</div>"
             )
@@ -99,7 +101,7 @@ def build_email_html(
         pname = r.get("product_name", "")
         out_xlsx = r.get("out_xlsx", "")
         if out_xlsx:
-            file_notes.append(f"<li>{pname}: {out_xlsx}</li>")
+            file_notes.append(f"<li>{html.escape(str(pname))}: {html.escape(str(out_xlsx))}</li>")
 
     exclude_note = ""
     if exclude:
@@ -145,7 +147,7 @@ td {{ padding: 8px 12px; border: 1px solid #ddd; }}
 <ul style="margin:4px 0;padding-left:18px;">
 {''.join(file_notes)}
 </ul>
-<p style="margin-top:12px;">本邮件由 MarketAnalysis 自动生成。</p>
+<p style="margin-top:12px;">本邮件由弘运盛泰自动生成。</p>
 </div>
 </body>
 </html>"""
@@ -181,7 +183,7 @@ def _build_single_product_html(
         )
 
     out_xlsx = r.get("out_xlsx", "")
-    file_note = f"<li>{pname}: {out_xlsx}</li>" if out_xlsx else ""
+    file_note = f"<li>{html.escape(str(pname))}: {html.escape(str(out_xlsx))}</li>" if out_xlsx else ""
 
     return f"""<!DOCTYPE html>
 <html>
@@ -197,7 +199,7 @@ td {{ padding: 8px 12px; border: 1px solid #ddd; }}
 </style>
 </head>
 <body>
-<h2>📊 {pname} — {trade_date.isoformat()}</h2>
+<h2>📊 {html.escape(str(pname))} — {trade_date.isoformat()}</h2>
 <table>
 <thead>
 <tr>
@@ -222,7 +224,7 @@ td {{ padding: 8px 12px; border: 1px solid #ddd; }}
 <ul style="margin:4px 0;padding-left:18px;">
 {file_note}
 </ul>
-<p style="margin-top:12px;">本邮件由 MarketAnalysis 自动生成。</p>
+<p style="margin-top:12px;">本邮件由弘运盛泰自动生成。</p>
 </div>
 </body>
 </html>"""
@@ -362,7 +364,7 @@ def build_weight_matrix_table(
 
     header_cols = ["<th style='background:#4a90d9;color:#fff;padding:10px 12px;border:1px solid #ddd;text-align:center;'>标的名称</th>"]
     for pname in product_names:
-        header_cols.append(f"<th style='background:#4a90d9;color:#fff;padding:10px 12px;border:1px solid #ddd;text-align:center;white-space:nowrap;'>{pname}</th>")
+        header_cols.append(f"<th style='background:#4a90d9;color:#fff;padding:10px 12px;border:1px solid #ddd;text-align:center;white-space:nowrap;'>{html.escape(str(pname))}</th>")
     header_row = "<tr>" + "".join(header_cols) + "</tr>"
 
     # 单位净值 / 资产净值 行
@@ -379,7 +381,7 @@ def build_weight_matrix_table(
     body_rows: list[str] = []
     for i, ticker in enumerate(ticker_list):
         bg = "#f9fafc" if i % 2 == 0 else "#ffffff"
-        cells = [f"<td style='padding:8px 12px;border:1px solid #ddd;background:{bg};font-weight:600;'>{ticker}</td>"]
+        cells = [f"<td style='padding:8px 12px;border:1px solid #ddd;background:{bg};font-weight:600;'>{html.escape(str(ticker))}</td>"]
         for pname in product_names:
             w = product_weights[pname].get(ticker)
             if w is not None:
@@ -427,7 +429,7 @@ def build_weight_matrix_html(
             cid = f"chart_{_safe_cid(pname)}"
             chart_sections.append(
                 f"<div style='margin:20px 0;text-align:center;'>"
-                f"<h4 style='font-size:13px;color:#333;margin-bottom:6px;'>{pname}</h4>"
+                f"<h4 style='font-size:13px;color:#333;margin-bottom:6px;'>{html.escape(str(pname))}</h4>"
                 f"<img src='cid:{cid}' style='max-width:500px;width:100%;height:auto;border:1px solid #eee;border-radius:4px;' />"
                 f"</div>"
             )
@@ -450,7 +452,7 @@ h2 {{ font-size: 18px; color: #1a1a1a; border-bottom: 2px solid #4a90d9; padding
 {''.join(chart_sections)}
 
 <div class="footer">
-<p style="margin-top:12px;">本邮件由 MarketAnalysis 自动生成。</p>
+<p style="margin-top:12px;">本邮件由弘运盛泰自动生成。</p>
 </div>
 </body>
 </html>"""

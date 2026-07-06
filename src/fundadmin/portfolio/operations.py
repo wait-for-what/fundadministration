@@ -37,10 +37,13 @@ import hashlib
 import imaplib
 import json
 import logging
+import os
 import re
 import shutil
 import ssl
+import tempfile
 import time
+import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -286,12 +289,74 @@ def _parse_csv_arg(value: str) -> list[str]:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
 
+def _sender_allowed(sender: str, allow_tokens: set[str]) -> bool:
+    """发件人是否在白名单内。
+
+    只对解析出的邮件地址（addr-spec）做匹配，不匹配显示名——否则把可信关键词放进
+    显示名即可冒充（email-ingest-1）。allow_tokens 为空时不做过滤（返回 True）。
+    """
+    if not allow_tokens:
+        return True
+    from email.utils import parseaddr
+
+    addr = (parseaddr(sender or "")[1] or "").lower()
+    if not addr:
+        return False
+    return any(tok in addr for tok in allow_tokens)
+
+
+def _resolve_sender_tokens(args: argparse.Namespace) -> list[str]:
+    """合并 CLI --sender-allowlist 与 .env 的 IMAP_SENDER_ALLOWLIST。
+
+    让每日定时任务无需改 plist 即可在 .env 配置可信发件人域名/地址。两者皆空时告警，
+    使"入库无发件人鉴别"对运维可见（email-ingest-1）。
+    """
+    tokens = _parse_csv_arg(str(getattr(args, "sender_allowlist", "") or ""))
+    if not tokens:
+        tokens = _parse_csv_arg(str(get_env("IMAP_SENDER_ALLOWLIST", default="") or ""))
+    if not tokens:
+        warnings.warn(
+            "未配置发件人白名单（--sender-allowlist 或 .env IMAP_SENDER_ALLOWLIST 均为空）："
+            "券商邮件入库无发件人鉴别，任何落入邮箱且主题命中产品名的邮件都会被采信（email-ingest-1）。",
+            stacklevel=2,
+        )
+    return tokens
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """原子写文本：写同目录临时文件并 fsync，再 os.replace 覆盖目标。
+
+    ``Path.write_text`` 是"截断-再写"，崩溃/掉电会留下半截 JSON，损坏去重/发布
+    状态（ops-sync-3 / reliability-2）。os.replace 在同一文件系统上是原子替换。
+    """
+    _ensure_dir(path.parent)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _load_email_sync_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"version": 1, "processed_messages": {}}
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError(f"invalid state file payload: {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("payload is not a dict")
+    except (json.JSONDecodeError, ValueError, OSError) as exc:
+        # 去重状态损坏只影响"是否重新扫描"，不触发对外发送：降级为空状态重新扫描，
+        # 比让整轮下载因一处坏文件而崩溃更安全（ops-sync-3）。
+        logger.error("email_sync_state 损坏，按空状态重建并重新扫描: %s (%s)", path, exc)
+        return {"version": 1, "processed_messages": {}}
     processed = raw.get("processed_messages")
     if not isinstance(processed, dict):
         raw["processed_messages"] = {}
@@ -300,8 +365,7 @@ def _load_email_sync_state(path: Path) -> dict[str, Any]:
 
 
 def _save_email_sync_state(path: Path, state: dict[str, Any]) -> None:
-    _ensure_dir(path.parent)
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
 
 
 def _load_publish_state(path: Path) -> dict[str, Any]:
@@ -312,6 +376,8 @@ def _load_publish_state(path: Path) -> dict[str, Any]:
     """
     if not path.exists():
         return {"version": 1, "published": {}}
+    # 发布状态是"发送去重"凭据。与 email_sync_state 不同，损坏时绝不静默重置为空——
+    # 那会导致对全体客户重发净值邮件。宁可让本轮发布段报错由运维介入（ops-sync-3）。
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError(f"invalid publish state payload: {path}")
@@ -322,8 +388,7 @@ def _load_publish_state(path: Path) -> dict[str, Any]:
 
 
 def _save_publish_state(path: Path, state: dict[str, Any]) -> None:
-    _ensure_dir(path.parent)
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
 
 
 def _publish_channel_done(state: dict[str, Any], trade_date: date, channel: str) -> bool:
@@ -543,8 +608,7 @@ def fetch_excel_attachments_via_imap(
                 msg = message_from_bytes(hb)
                 subject = _decode_email_header(msg.get("Subject"))
                 sender = _decode_email_header(msg.get("From"))
-                sender_lower = sender.lower()
-                if allow_senders and not any(token in sender_lower for token in allow_senders):
+                if not _sender_allowed(sender, allow_senders):
                     continue
                 if keywords:
                     subject_lower = subject.lower()
@@ -762,8 +826,7 @@ def _fetch_excel_attachments_via_imap_with_state(
                 msg = message_from_bytes(header_bytes)
                 subject = _decode_email_header(msg.get("Subject"))
                 sender = _decode_email_header(msg.get("From"))
-                sender_lower = sender.lower()
-                if allow_senders and not any(token in sender_lower for token in allow_senders):
+                if not _sender_allowed(sender, allow_senders):
                     continue
                 if keywords:
                     subject_lower = subject.lower()
@@ -1097,6 +1160,21 @@ def _product_email_completion_issues(
     if empty_holdings:
         issues.append(f"empty holdings: {', '.join(empty_holdings)}")
 
+    # 持仓存在但市值无法解析（NaN）时，.sum() 会把它当 0 计入，静默低估暴露并扭曲权重
+    # （ops-positions-3）。NaN 专指"定不出价"，与真实 0 区分；任一持仓缺市值即视为不完整。
+    underpriced: list[str] = []
+    for name in expected_names:
+        result = by_name.get(name)
+        if result is None:
+            continue
+        hr = result.get("holdings_raw")
+        if hr is None or getattr(hr, "empty", True) or "market_value_cny" not in getattr(hr, "columns", []):
+            continue
+        if pd.to_numeric(hr["market_value_cny"], errors="coerce").isna().any():
+            underpriced.append(name)
+    if underpriced:
+        issues.append(f"holdings missing market value: {', '.join(underpriced)}")
+
     missing_outputs: list[str] = []
     for name in expected_names:
         result = by_name.get(name)
@@ -1123,6 +1201,23 @@ def _product_email_completion_issues(
             issues.append(f"missing charts: {', '.join(missing_charts)}")
 
     return issues
+
+
+def _client_unit_nav_missing(results: list[dict[str, Any]]) -> list[str]:
+    """列出 unit_nav 缺失的已配置产品（notifications-2）。
+
+    客户净值邮件以 ``unit_nav * shares`` 计算持仓市值；共享完整性门槛只看
+    ``nav``（优先 asset_nav），asset_nav 在而 unit_nav 缺失时会放行，却让客户
+    收到单位净值/市值全为 N/A 的空通知。客户通道据此额外拦截。
+    """
+    expected = [str(cfg.get("name", "")).strip() for cfg in PRODUCT_CONFIG]
+    expected = [name for name in expected if name]
+    by_name = {
+        str(r.get("product_name", "")).strip(): r
+        for r in results
+        if str(r.get("product_name", "")).strip()
+    }
+    return [name for name in expected if name in by_name and by_name[name].get("unit_nav") is None]
 
 
 def _probe_standard_holdings_paths(paths: Iterable[Path]) -> list[Path]:
@@ -1433,7 +1528,7 @@ def _run_email_sync_for_trade_date(
         imap=_resolve_imap_config_from_args(args),
         target_date=trade_date,
         out_dir=resolved_out_dir,
-        sender_allowlist=_parse_csv_arg(str(getattr(args, "sender_allowlist", "") or "")),
+        sender_allowlist=_resolve_sender_tokens(args),
         subject_keywords=_parse_csv_arg(str(getattr(args, "subject_keywords", "") or "")),
         state_file=state_file,
         skip_processed=skip_processed,
@@ -1484,7 +1579,7 @@ def _persist_attachments_raw(
     入库失败仅告警，不影响报表/邮件主流程。
     """
     from fundadmin.clients.schema import init_db
-    from fundadmin.clients.store import insert_attachment, upsert_raw_sheet_rows
+    from fundadmin.clients.store import insert_attachment_with_rows
     from fundadmin.portfolio.parsers.common import read_csv_robust
 
     try:
@@ -1521,26 +1616,27 @@ def _persist_attachments_raw(
                 "row_count": int(total_rows),
                 "inbox_dir": str(inbox_dir),
             }
-            ingest_id, is_new = insert_attachment(meta)
+            def _build_rows(ingest_id: int, _sheets=sheets) -> pd.DataFrame:
+                rows: list[dict[str, Any]] = []
+                for s_idx, (s_name, df) in enumerate(_sheets):
+                    for r_idx, (_, row) in enumerate(df.iterrows()):
+                        cells = [None if pd.isna(v) else v for v in row.tolist()]
+                        rows.append(
+                            {
+                                "ingest_id": ingest_id,
+                                "sheet_index": s_idx,
+                                "sheet_name": str(s_name),
+                                "row_index": r_idx,
+                                "cells_json": json.dumps(cells, ensure_ascii=False, default=str),
+                            }
+                        )
+                return pd.DataFrame(rows)
+
+            # 登记附件 + 写原始行在同一事务内完成，避免孤儿附件（raw-ingest gap）。
+            _ingest_id, is_new, _n_rows = insert_attachment_with_rows(meta, _build_rows)
             if not is_new:
                 skipped += 1
                 continue
-
-            rows: list[dict[str, Any]] = []
-            for s_idx, (s_name, df) in enumerate(sheets):
-                for r_idx, (_, row) in enumerate(df.iterrows()):
-                    cells = [None if pd.isna(v) else v for v in row.tolist()]
-                    rows.append(
-                        {
-                            "ingest_id": ingest_id,
-                            "sheet_index": s_idx,
-                            "sheet_name": str(s_name),
-                            "row_index": r_idx,
-                            "cells_json": json.dumps(cells, ensure_ascii=False, default=str),
-                        }
-                    )
-            if rows:
-                upsert_raw_sheet_rows(pd.DataFrame(rows))
             ingested += 1
         except Exception:
             logger.exception("raw-layer ingest failed for %s", path)
@@ -1552,8 +1648,11 @@ def _persist_curated_layer(
     results: list[dict[str, Any]],
     *,
     effective_trade_date: date,
-) -> None:
-    """核心结构层：写 product_valuation + fund_positions（分券商）。入库失败仅告警。
+) -> bool:
+    """核心结构层：写 product_valuation + fund_positions（分券商）。
+
+    返回 True 表示入库成功；False 表示发生异常（已记日志）。调用方据此阻断通知，
+    避免在结构层写失败、DB 处于不一致状态时仍对外发净值邮件（ops-positions-2）。
 
     fund_positions 按 (产品, 标的, 券商) 逐行落地：同一标的若同时在中金、中信持有，
     各券商单独成行（broker 真实填充），不再跨券商折叠。写入前先删除该产品该估值日的
@@ -1561,8 +1660,7 @@ def _persist_curated_layer(
     """
     from fundadmin.clients.config import NAME_TO_PRODCODE
     from fundadmin.clients.store import (
-        delete_positions,
-        upsert_positions,
+        replace_positions,
         upsert_product_valuation,
     )
 
@@ -1614,12 +1712,14 @@ def _persist_curated_layer(
         n_val = upsert_product_valuation(pd.DataFrame(val_rows)) if val_rows else 0
         n_pos = 0
         for pcode, frames in pos_by_pcode.items():
-            # 先清旧快照再写新分券商行：重跑幂等，并清理已清仓的残留标的。
-            delete_positions(pcode, as_of)
-            n_pos += upsert_positions(pd.concat(frames, ignore_index=True))
+            # 单事务内"清旧快照 + 写新分券商行"：重跑幂等，且失败回滚到旧快照，
+            # 不留空/半快照（clients-store-3 / ops-sync-11）。
+            n_pos += replace_positions(pcode, as_of, pd.concat(frames, ignore_index=True))
         print(f"[OK] curated-layer: {n_val} valuation row(s), {n_pos} position row(s, per-broker)")
+        return True
     except Exception:
         logger.exception("curated-layer persistence failed")
+        return False
 
 
 def _build_tx_product_lookup() -> dict[str, tuple[str, str]]:
@@ -1765,8 +1865,9 @@ def _build_product_reports_for_trade_date(
     for result in results:
         print(f"  {result['product_name']}: {result['out_xlsx']}")
 
-    # 核心结构层：从 build 结果写 product_valuation + fund_positions（失败仅告警）。
-    _persist_curated_layer(results, effective_trade_date=effective_trade_date)
+    # 核心结构层：从 build 结果写 product_valuation + fund_positions。
+    # 入库失败时 curated_ok=False，后续据此阻断对外通知（ops-positions-2）。
+    curated_ok = _persist_curated_layer(results, effective_trade_date=effective_trade_date)
 
     # 成交流水层：解析 CICC/CITIC 成交全量入库（按 occ 去重；失败仅告警）。
     _persist_transactions(files, effective_trade_date=effective_trade_date)
@@ -1826,9 +1927,11 @@ def _build_product_reports_for_trade_date(
     email_sent = False
     email_skip_reason = ""
     client_notify_sent = 0
+    client_notify_eligible = 0
+    client_notify_failed = 0
     client_notify_skip_reason = ""
-    # 两封邮件（内部持仓汇总 + 客户净值通知）共用同一完整性门槛：
-    # 仅当成功构建且数据完整（_product_email_completion_issues 为空）时才发送。
+    # 矩阵邮件与客户净值邮件分别独立把门：内部矩阵用 asset_nav 即可，客户邮件还需
+    # unit_nav（notifications-2）；且结构层入库失败时两者都不发（ops-positions-2）。
     if with_email or notify_clients:
         completion_issues = _product_email_completion_issues(
             results=results,
@@ -1836,19 +1939,32 @@ def _build_product_reports_for_trade_date(
             require_charts=with_charts,
             chart_paths=chart_paths,
         )
-        if completion_issues:
-            reason = "; ".join(completion_issues)
-            if with_email:
-                email_skip_reason = reason
-                print(f"[WARN] matrix email skipped: {reason}")
-            if notify_clients:
-                client_notify_skip_reason = reason
-                print(f"[WARN] client NAV notify skipped: {reason}")
-        else:
+        if not curated_ok:
+            completion_issues.append("curated-layer persistence failed (DB write incomplete)")
+
+        client_issues = list(completion_issues)
+        missing_unit_nav = _client_unit_nav_missing(results)
+        if missing_unit_nav:
+            client_issues.append(
+                f"missing unit_nav (client market value uncomputable): {', '.join(missing_unit_nav)}"
+            )
+
+        matrix_blocked = bool(completion_issues)
+        client_blocked = bool(client_issues)
+        if with_email and matrix_blocked:
+            email_skip_reason = "; ".join(completion_issues)
+            print(f"[WARN] matrix email skipped: {email_skip_reason}")
+        if notify_clients and client_blocked:
+            client_notify_skip_reason = "; ".join(client_issues)
+            print(f"[WARN] client NAV notify skipped: {client_notify_skip_reason}")
+
+        send_matrix = with_email and not matrix_blocked
+        send_clients = notify_clients and not client_blocked
+        if send_matrix or send_clients:
             load_env()
 
             # ---- 内部持仓汇总邮件（EMAIL_TO，QQ 邮箱 SMTP）----
-            if with_email:
+            if send_matrix:
                 to_addrs = [x.strip() for x in str(email_to or "").split(",") if x.strip()]
                 if not to_addrs:
                     env_to = get_env("EMAIL_TO", default="")
@@ -1908,7 +2024,7 @@ def _build_product_reports_for_trade_date(
                     logger.exception("by-broker summary email failed")
 
             # ---- 客户净值通知（clients 表，企业邮箱 SMTP xuekun@hysttz.com）----
-            if notify_clients:
+            if send_clients:
                 nc_user = str(get_env("IMAP_USER", default="") or "")
                 nc_pass = str(get_env("IMAP_PASS", default="") or "")
                 if not nc_user or not nc_pass:
@@ -1931,10 +2047,19 @@ def _build_product_reports_for_trade_date(
                         smtp_config=nc_smtp,
                     )
                     client_notify_sent = int(stats.get("sent", 0))
+                    client_notify_eligible = int(stats.get("eligible", 0))
+                    client_notify_failed = int(stats.get("failed", 0))
                     print(
                         f"[OK] client NAV notify: {stats['sent']} sent, "
-                        f"{stats['skipped']} skipped, {stats.get('total', 0)} total"
+                        f"{stats['skipped']} skipped, {stats.get('failed', 0)} failed, "
+                        f"{stats.get('total', 0)} total"
                     )
+                    if client_notify_failed:
+                        # 发送失败的客户保留以便重试（notifications-4）：发布状态由调用方据此决定。
+                        print(
+                            f"[WARN] client NAV notify: {client_notify_failed} 个客户发送失败 "
+                            f"-> {', '.join(stats.get('failed_clients', []))}"
+                        )
 
     payload = {
         "trade_date": effective_trade_date.isoformat(),
@@ -1949,6 +2074,8 @@ def _build_product_reports_for_trade_date(
         payload["email_skip_reason"] = email_skip_reason
     if notify_clients:
         payload["client_notify_sent"] = client_notify_sent
+        payload["client_notify_eligible"] = client_notify_eligible
+        payload["client_notify_failed"] = client_notify_failed
         payload["client_notify_skip_reason"] = client_notify_skip_reason
     return payload
 
@@ -1958,7 +2085,7 @@ def _cmd_email_sync(args: argparse.Namespace) -> int:
     trade_date = _resolve_trade_date_arg(args.trade_date)
     if bool(getattr(args, "print_search", False)):
         # 干跑：仅打印将要发给 IMAP 服务端的 SEARCH 表达式，不联网
-        sender_tokens = _parse_csv_arg(str(getattr(args, "sender_allowlist", "") or ""))
+        sender_tokens = _resolve_sender_tokens(args)
         subject_kw = _parse_csv_arg(str(getattr(args, "subject_keywords", "") or ""))
         criteria = build_imap_search_criteria(
             since=trade_date,
@@ -2211,9 +2338,28 @@ def _cmd_sync_latest(args: argparse.Namespace) -> int:
             if want_matrix and payload.get("email_sent"):
                 _mark_publish_channel(publish_state, trade_date, "matrix")
                 matrix_sent += 1
-            if want_clients and int(payload.get("client_notify_sent") or 0) > 0:
-                _mark_publish_channel(publish_state, trade_date, "clients")
-                clients_sent += 1
+            if want_clients:
+                c_sent = int(payload.get("client_notify_sent") or 0)
+                c_failed = int(payload.get("client_notify_failed") or 0)
+                skip_reason = str(payload.get("client_notify_skip_reason") or "")
+                if skip_reason:
+                    # 被完整性门槛或配置缺失拦截：不标记已发布，待数据/配置就绪后下次重试。
+                    pass
+                elif c_failed == 0:
+                    # 实际发送且无失败（含"无合格收件人"的空集）：标记已发布。
+                    _mark_publish_channel(publish_state, trade_date, "clients")
+                    clients_sent += 1
+                elif c_sent == 0:
+                    # 全部失败（如 SMTP 整体不可用）：不标记，下次整体重试，不产生重复（notifications-4）。
+                    logger.error("client NAV notify 全部失败 %s，将于下次运行重试", trade_date.isoformat())
+                else:
+                    # 部分失败：已成功者不再重发以免重复，标记已发布并提示人工补发失败客户。
+                    logger.error(
+                        "client NAV notify 部分失败 %s (sent=%d failed=%d)，已标记发布避免重复，需人工补发失败客户",
+                        trade_date.isoformat(), c_sent, c_failed,
+                    )
+                    _mark_publish_channel(publish_state, trade_date, "clients")
+                    clients_sent += 1
             _save_publish_state(publish_state_path, publish_state)
 
     print(
@@ -2389,6 +2535,18 @@ def _cmd_reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _warn_cli_secret(args: argparse.Namespace) -> None:
+    """命令行传入口令会泄露到进程表 / shell 历史，提示改用 .env（security-4）。"""
+    for attr, env in (("imap_pass", "IMAP_PASS"), ("smtp_pass", "SMTP_PASS")):
+        if str(getattr(args, attr, "") or "").strip():
+            flag = "--" + attr.replace("_", "-")
+            warnings.warn(
+                f"通过 {flag} 传入明文口令不安全（会出现在进程表与 shell 历史中）；"
+                f"请改为在 .env 设置 {env}，并去掉该命令行参数（security-4）。",
+                stacklevel=2,
+            )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser("fund_portfolio")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -2399,7 +2557,7 @@ def main(argv: list[str] | None = None) -> int:
     parser_email_sync.add_argument("--imap-host", default="", help="Override IMAP_HOST.")
     parser_email_sync.add_argument("--imap-port", default=0, type=int, help="Override IMAP_PORT.")
     parser_email_sync.add_argument("--imap-user", default="", help="Override IMAP_USER.")
-    parser_email_sync.add_argument("--imap-pass", default="", help="Override IMAP_PASS.")
+    parser_email_sync.add_argument("--imap-pass", default="", help="Override IMAP_PASS. 不安全：明文口令会泄露到进程表/历史，优先用 .env。")
     parser_email_sync.add_argument("--imap-mailbox", default="", help="Override IMAP_MAILBOX.")
     parser_email_sync.add_argument("--imap-ssl", action=argparse.BooleanOptionalAction, default=True)
     parser_email_sync.add_argument("--sender-allowlist", default="", help="Comma-separated sender keywords to allow.")
@@ -2421,7 +2579,7 @@ def main(argv: list[str] | None = None) -> int:
     parser_sync.add_argument("--imap-host", default="", help="Override IMAP_HOST.")
     parser_sync.add_argument("--imap-port", default=0, type=int, help="Override IMAP_PORT.")
     parser_sync.add_argument("--imap-user", default="", help="Override IMAP_USER.")
-    parser_sync.add_argument("--imap-pass", default="", help="Override IMAP_PASS.")
+    parser_sync.add_argument("--imap-pass", default="", help="Override IMAP_PASS. 不安全：明文口令会泄露到进程表/历史，优先用 .env。")
     parser_sync.add_argument("--imap-mailbox", default="", help="Override IMAP_MAILBOX.")
     parser_sync.add_argument("--imap-ssl", action=argparse.BooleanOptionalAction, default=True)
     parser_sync.add_argument("--sender-allowlist", default="", help="Comma-separated sender keywords to allow.")
@@ -2446,7 +2604,7 @@ def main(argv: list[str] | None = None) -> int:
     parser_build.add_argument("--smtp-host", default="", help="Override SMTP_HOST.")
     parser_build.add_argument("--smtp-port", default=0, type=int, help="Override SMTP_PORT.")
     parser_build.add_argument("--smtp-user", default="", help="Override SMTP_USER.")
-    parser_build.add_argument("--smtp-pass", default="", help="Override SMTP_PASS.")
+    parser_build.add_argument("--smtp-pass", default="", help="Override SMTP_PASS. 不安全：明文口令会泄露到进程表/历史，优先用 .env。")
     parser_build.add_argument("--smtp-from", default="", help="Override EMAIL_FROM.")
     parser_build.set_defaults(func=_cmd_build)
 
@@ -2473,7 +2631,7 @@ def main(argv: list[str] | None = None) -> int:
     parser_bp.add_argument("--smtp-host", default="", help="Override SMTP_HOST.")
     parser_bp.add_argument("--smtp-port", default=0, type=int, help="Override SMTP_PORT.")
     parser_bp.add_argument("--smtp-user", default="", help="Override SMTP_USER.")
-    parser_bp.add_argument("--smtp-pass", default="", help="Override SMTP_PASS.")
+    parser_bp.add_argument("--smtp-pass", default="", help="Override SMTP_PASS. 不安全：明文口令会泄露到进程表/历史，优先用 .env。")
     parser_bp.add_argument("--smtp-from", default="", help="Override EMAIL_FROM.")
     parser_bp.set_defaults(func=_cmd_build_products)
 
@@ -2492,7 +2650,7 @@ def main(argv: list[str] | None = None) -> int:
     parser_nc.add_argument("--smtp-host", default="", help="Override SMTP_HOST.")
     parser_nc.add_argument("--smtp-port", default=0, type=int, help="Override SMTP_PORT.")
     parser_nc.add_argument("--smtp-user", default="", help="Override SMTP_USER.")
-    parser_nc.add_argument("--smtp-pass", default="", help="Override SMTP_PASS.")
+    parser_nc.add_argument("--smtp-pass", default="", help="Override SMTP_PASS. 不安全：明文口令会泄露到进程表/历史，优先用 .env。")
     parser_nc.add_argument("--smtp-from", default="", help="Override EMAIL_FROM.")
     parser_nc.set_defaults(func=_cmd_notify_clients)
 
@@ -2510,6 +2668,7 @@ def main(argv: list[str] | None = None) -> int:
     parser_rec.set_defaults(func=_cmd_reconcile)
 
     args = parser.parse_args(argv)
+    _warn_cli_secret(args)
     func = getattr(args, "func", None)
     if not callable(func):
         raise RuntimeError("command handler missing")

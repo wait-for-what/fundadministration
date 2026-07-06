@@ -21,6 +21,9 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- 崩溃/误配时避免紧密重启风暴：两次拉起至少间隔 10s (reliability-8)。 -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
     <key>WorkingDirectory</key>
     <string>/Users/admin/fundadmin/FundAdministration</string>
     <key>StandardOutPath</key>

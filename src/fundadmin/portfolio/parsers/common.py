@@ -53,6 +53,15 @@ def to_float(value: Any) -> float | None:
     # 去掉千分位逗号与中文字符逗号
     text = text.replace(",", "").replace("，", "")
 
+    # 会计括号负数：中文券商估值/Balance 表常用 (1234.50) / (500) 表示负数。
+    # 历史实现对此返回 None，导致负持仓/负 P&L 被静默丢弃或经 fillna 变成 0（parsers-1）。
+    paren = re.match(r"^\((\d+(?:\.\d+)?)\)$", text)
+    if paren:
+        try:
+            return -float(paren.group(1))
+        except Exception:
+            return None
+
     # 百分比
     percent_match = re.match(r"^(-?\d+(?:\.\d+)?)\s*%$", text)
     if percent_match:
@@ -68,11 +77,15 @@ def to_float(value: Any) -> float | None:
 
 
 def to_int(value: Any) -> int | None:
-    """将字符串/数值转换为 int，返回 None 表示失败。"""
+    """将字符串/数值转换为 int（四舍五入），返回 None 表示失败。
+
+    历史实现用 ``int()`` 向零截断：openpyxl 把整数股数存成 999.9999999 这类浮点噪声时
+    会少算一股（parsers-5）。改用 round() 消除浮点噪声导致的 off-by-one。
+    """
     f = to_float(value)
     if f is None:
         return None
-    return int(f)
+    return int(round(f))
 
 
 def normalize_date(value: Any) -> str | None:
@@ -111,8 +124,18 @@ def normalize_date(value: Any) -> str | None:
     return None
 
 
-def read_csv_robust(path: Path, *, encoding: str | None = None, skiprows: int | None = None) -> pd.DataFrame:
-    """尝试多种编码读取 CSV，失败时抛出异常。"""
+def read_csv_robust(
+    path: Path, *, encoding: str | None = None, skiprows: int | None = None, **kwargs: Any
+) -> pd.DataFrame:
+    """尝试多种编码读取 CSV，失败时抛出异常。
+
+    中文券商 CSV 常为 GBK/GB18030 编码；硬编码 utf-8-sig 会抛 UnicodeDecodeError
+    或解码出乱码导致表头识别失败、整张表静默丢失（parsers-3）。这里按候选编码依次
+    尝试，并透传 ``header`` / ``dtype`` 等参数给 pandas（``dtype`` 默认 object）。
+    """
+    kwargs.setdefault("dtype", object)
+    if skiprows is not None:
+        kwargs["skiprows"] = skiprows
     encodings = [encoding] if encoding else []
     encodings += ["utf-8-sig", "utf-8", "gbk", "gb2312", "gb18030", "cp1252"]
     last_exc: Exception | None = None
@@ -120,7 +143,7 @@ def read_csv_robust(path: Path, *, encoding: str | None = None, skiprows: int | 
         if enc is None:
             continue
         try:
-            return pd.read_csv(path, encoding=enc, skiprows=skiprows, dtype=object)
+            return pd.read_csv(path, encoding=enc, **kwargs)
         except Exception as exc:
             last_exc = exc
-    raise RuntimeError(f"无法读取 CSV {path}: {last_exc}")
+    raise RuntimeError(f"无法以候选编码读取 CSV {path}: {last_exc}")

@@ -17,6 +17,7 @@ import pandas as pd
 
 from fundadmin.portfolio.parsers.common import (
     clean_ticker,
+    read_csv_robust,
     to_float,
     to_int,
 )
@@ -37,6 +38,23 @@ CITIC_CCY_LABELS = {"交易货币", "计价货币", "币种"}
 
 # Balance 汇率列头别名
 CITIC_FX_LABELS = {"汇率（交易货币/结算货币）", "汇率", "汇率(交易货币/结算货币)"}
+# 衍生品"互换标的信息"sheet 列头别名（parsers-7：避免写死 sheet 索引 2 / row.iloc[-1]）。
+CITIC_DERIV_SHEET_NAME = "互换标的信息"
+CITIC_DERIV_CODE_LABELS = {"标的代码", "证券代码", "代码", "合约代码"}
+CITIC_DERIV_NAME_LABELS = {"标的名称", "证券名称", "名称", "合约名称"}
+CITIC_DERIV_QTY_LABELS = {"合约数量", "名义数量", "数量", "持仓数量"}
+CITIC_DERIV_MV_CNY_LABELS = {"市值(人民币)", "市值（人民币）", "人民币市值", "市值"}
+
+
+def _resolve_citic_deriv_col(df: pd.DataFrame, labels: set[str], fallback_idx: int):
+    """按表头别名定位列；未命中回退到历史位置（越界则报错）。"""
+    for col in df.columns:
+        if str(col).strip().replace(" ", "") in labels:
+            return col
+    cols = list(df.columns)
+    if -len(cols) <= fallback_idx < len(cols):
+        return cols[fallback_idx]
+    raise ValueError("CITICS 衍生品估值表无法定位必要列，且回退位置越界")
 
 
 def _detect_header_row(df: pd.DataFrame, target_labels: set[str], min_hits: int = 2) -> int:
@@ -63,7 +81,7 @@ def parse_citic_fx(balance_path: Path, *, sheet: str | int = 0) -> float:
     """
     suffix = balance_path.suffix.lower()
     if suffix == ".csv":
-        df_raw = pd.read_csv(balance_path, header=None, dtype=object, encoding="utf-8-sig")
+        df_raw = read_csv_robust(balance_path, header=None)
     elif suffix in {".xlsx", ".xlsm"}:
         df_raw = pd.read_excel(balance_path, sheet_name=sheet, header=None, dtype=object, engine="openpyxl")
     elif suffix == ".xls":
@@ -129,7 +147,7 @@ def parse_citic_underlying(underlying_path: Path, fx: float, *, sheet: str | int
     """
     suffix = underlying_path.suffix.lower()
     if suffix == ".csv":
-        df_raw = pd.read_csv(underlying_path, header=None, dtype=object, encoding="utf-8-sig")
+        df_raw = read_csv_robust(underlying_path, header=None)
     elif suffix in {".xlsx", ".xlsm"}:
         df_raw = pd.read_excel(underlying_path, sheet_name=sheet, header=None, dtype=object, engine="openpyxl")
     elif suffix == ".xls":
@@ -222,21 +240,31 @@ def parse_citics_derivative_holdings(path: Path) -> pd.DataFrame:
     if len(xl.sheet_names) < 3:
         raise ValueError(f"CITICS 衍生品估值表缺少必要 sheet: {path}")
 
-    # Sheet 2 = 互换标的信息
-    df_raw = pd.read_excel(path, sheet_name=2, header=0, dtype=object, engine="openpyxl")
+    # 优先按名定位"互换标的信息"sheet，回退到历史索引 2（parsers-7）。
+    target_sheet: str | int = 2
+    for name in xl.sheet_names:
+        if str(name).strip().replace(" ", "") == CITIC_DERIV_SHEET_NAME:
+            target_sheet = name
+            break
+    df_raw = pd.read_excel(path, sheet_name=target_sheet, header=0, dtype=object, engine="openpyxl")
     if df_raw.empty:
         raise ValueError(f"CITICS 衍生品估值表互换标的信息为空: {path}")
 
-    # 过滤有效数据行：标的代码列（第3列，索引2）包含 '.' 且长度 > 3
+    # 按表头定位列，回退到历史位置（name=1, code=2, qty=4, mv=-1），避免列重排后读错列。
+    code_col = _resolve_citic_deriv_col(df_raw, CITIC_DERIV_CODE_LABELS, 2)
+    name_col = _resolve_citic_deriv_col(df_raw, CITIC_DERIV_NAME_LABELS, 1)
+    qty_col = _resolve_citic_deriv_col(df_raw, CITIC_DERIV_QTY_LABELS, 4)
+    mv_col = _resolve_citic_deriv_col(df_raw, CITIC_DERIV_MV_CNY_LABELS, -1)
+
     rows: list[dict[str, Any]] = []
     for _, row in df_raw.iterrows():
-        code = str(row.iloc[2] or "").strip()
-        name = str(row.iloc[1] or "").strip()
+        code = str(row[code_col] or "").strip()
+        name = str(row[name_col] or "").strip()
         if not code or "." not in code or len(code) <= 3:
             continue
 
-        qty = to_float(row.iloc[4])  # 合约数量
-        mv = to_float(row.iloc[-1])  # 市值(人民币)
+        qty = to_float(row[qty_col])  # 合约数量
+        mv = to_float(row[mv_col])  # 市值(人民币)
         if mv is None:
             continue
 

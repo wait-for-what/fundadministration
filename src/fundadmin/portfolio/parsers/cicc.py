@@ -18,6 +18,7 @@ import pandas as pd
 
 from fundadmin.portfolio.parsers.common import (
     clean_ticker,
+    read_csv_robust,
     to_float,
     to_int,
 )
@@ -27,17 +28,40 @@ CICC_NAME_LABELS = {"标的名称", "证券名称", "股票名称", "名称"}
 CICC_CODE_LABELS = {"标的代码", "证券代码", "股票代码", "代码"}
 CICC_QTY_LABELS = {"合约持仓", "持仓数量", "持仓股数", "数量"}
 CICC_CNY_MV_LABELS = {"市值（人民币）", "市值(人民币)", "人民币市值", "市值"}
+# 估值表"市值（本币）"列：历史硬编码为索引 11（parsers-4），改为按表头定位、越界才回退。
+CICC_VAL_MV_LABELS = {"市值（本币）", "市值(本币)", "市值（本位币）", "市值(本位币)", "本币市值", "市值本币"}
+_CICC_VAL_MV_COL_FALLBACK = 11
+
+
+def _detect_cicc_val_mv_col(df: pd.DataFrame) -> int:
+    """在估值表前若干行定位"市值（本币）"列号；未命中回退到历史索引 11。
+
+    历史实现把索引 11 写死，券商模板新增/删列后会读到错误列（成本/数量/占比），
+    静默产出错误的 NAV/市值（parsers-4）。优先按表头匹配，回退列越界则报错。
+    """
+    for r in range(min(15, len(df))):
+        for c in range(len(df.columns)):
+            cell = str(df.iloc[r, c] or "").strip().replace(" ", "")
+            if cell in CICC_VAL_MV_LABELS:
+                return c
+    if _CICC_VAL_MV_COL_FALLBACK < len(df.columns):
+        return _CICC_VAL_MV_COL_FALLBACK
+    raise ValueError("CICC 估值表未能定位'市值（本币）'列，且回退列号越界")
 
 
 def _detect_header_row(df: pd.DataFrame) -> int:
-    """通过关键词命中数定位表头行。"""
+    """通过关键词命中数定位表头行；未命中返回 -1（由调用方决定如何处理）。
+
+    历史实现未命中时回退到第 0 行并继续解析，会用错误表头静默产出垃圾数据
+    （parsers-8）。改为返回 -1，调用方据此抛出明确错误，让完整性闸拦住发布。
+    """
     target = CICC_NAME_LABELS | CICC_CODE_LABELS | CICC_QTY_LABELS | CICC_CNY_MV_LABELS
     for idx in range(min(60, len(df))):
         row_texts = {str(v or "").strip() for v in df.iloc[idx].tolist()}
         hits = sum(1 for label in target if label in row_texts)
         if hits >= 2:
             return idx
-    return 0
+    return -1
 
 
 def parse_cicc_valuation_navs(path: Path, *, sheet: str | int = 0) -> tuple[float, float]:
@@ -55,13 +79,14 @@ def parse_cicc_valuation_navs(path: Path, *, sheet: str | int = 0) -> tuple[floa
 
     unit_nav: float | None = None
     asset_nav: float | None = None
+    mv_col = _detect_cicc_val_mv_col(df)
 
     for row_idx in range(len(df)):
         first_col = str(df.iloc[row_idx, 0] or "").strip().replace(" ", "")
 
-        # 资产净值 — 取市值本币列（索引11）
+        # 资产净值 — 取"市值（本币）"列（按表头定位，回退索引 11）
         if first_col == "资产净值":
-            val = to_float(df.iloc[row_idx, 11])
+            val = to_float(df.iloc[row_idx, mv_col])
             if val is not None and val > 0:
                 asset_nav = val
 
@@ -113,6 +138,7 @@ def parse_cicc_valuation_holdings(path: Path, *, sheet: str | int = 0) -> pd.Dat
     if df.empty:
         raise ValueError(f"CICC 估值表为空: {path}")
 
+    mv_col = _detect_cicc_val_mv_col(df)
     rows: list[dict[str, Any]] = []
     for row_idx in range(len(df)):
         code = str(df.iloc[row_idx, 0] or "").strip()
@@ -121,7 +147,7 @@ def parse_cicc_valuation_holdings(path: Path, *, sheet: str | int = 0) -> pd.Dat
             continue
 
         name = str(df.iloc[row_idx, 1] or "").strip()
-        mv = to_float(df.iloc[row_idx, 11])  # 市值本币列
+        mv = to_float(df.iloc[row_idx, mv_col])  # 市值（本币）列（按表头定位，回退索引 11）
 
         if mv is None:
             continue
@@ -154,7 +180,7 @@ def parse_cicc_holdings(path: Path, *, sheet: str | int = 0) -> pd.DataFrame:
     """
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        df_raw = pd.read_csv(path, header=None, dtype=object, encoding="utf-8-sig")
+        df_raw = read_csv_robust(path, header=None)
     elif suffix == ".xls":
         df_raw = pd.read_excel(path, sheet_name=sheet, header=None, dtype=object, engine="xlrd")
     else:
@@ -164,6 +190,8 @@ def parse_cicc_holdings(path: Path, *, sheet: str | int = 0) -> pd.DataFrame:
         raise ValueError(f"中金持仓表为空: {path}")
 
     header_row = _detect_header_row(df_raw)
+    if header_row < 0:
+        raise ValueError(f"中金持仓表未能定位表头（未找到含 ≥2 个已知列名的行）: {path}")
     headers = [str(v or "").strip() for v in df_raw.iloc[header_row].tolist()]
     df = df_raw.iloc[header_row + 1 :].copy()
     df.columns = headers

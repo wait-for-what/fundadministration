@@ -22,13 +22,33 @@
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/admin/fundadmin/FundAdministration</string>
+    <!-- 仅工作日 18:00 触发（Weekday 1=周一 .. 5=周五），与"weekdays only"设计一致。 -->
     <key>StartCalendarInterval</key>
     <array>
         <dict>
-            <key>Hour</key>
-            <integer>18</integer>
-            <key>Minute</key>
-            <integer>0</integer>
+            <key>Weekday</key><integer>1</integer>
+            <key>Hour</key><integer>18</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>2</integer>
+            <key>Hour</key><integer>18</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>3</integer>
+            <key>Hour</key><integer>18</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>4</integer>
+            <key>Hour</key><integer>18</integer>
+            <key>Minute</key><integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>5</integer>
+            <key>Hour</key><integer>18</integer>
+            <key>Minute</key><integer>0</integer>
         </dict>
     </array>
     <key>StandardOutPath</key>

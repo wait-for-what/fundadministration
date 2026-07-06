@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 from datetime import date
 from typing import Any
@@ -120,8 +121,8 @@ def _render_product_card(
     # 头部色带（用 table 实现左右分栏，邮件客户端兼容性优于 flex）。
     header = (
         f"<table style='width:100%;border-collapse:collapse;background:{_C_BAND}'><tr>"
-        f"<td style='padding:11px 14px;font-size:15px;font-weight:700;color:#1f2937'>{product_name}"
-        f"<span style='font-weight:500;color:#6b7280;font-size:12px'>　{product_code} · {as_of}</span></td>"
+        f"<td style='padding:11px 14px;font-size:15px;font-weight:700;color:#1f2937'>{html.escape(str(product_name))}"
+        f"<span style='font-weight:500;color:#6b7280;font-size:12px'>　{html.escape(str(product_code))} · {html.escape(str(as_of))}</span></td>"
         f"<td style='padding:11px 14px;text-align:right;font-size:12px;color:#4b5563;white-space:nowrap'>"
         f"¥{total_mv:,.0f}　·　{n_stocks} 只　·　跨券商 <b style='color:#b8860b'>{n_cross}</b></td>"
         f"</tr></table>"
@@ -152,8 +153,8 @@ def _render_product_card(
             accent = ""
         cell = f"padding:6px 10px;border-bottom:1px solid #eef1f4;background:{bg};"
         tds = [
-            f"<td style='{cell}{accent}'>{r['名称']}</td>",
-            f"<td style='{cell}font-weight:600'>{r['代码']}{' 🔗' if cross else ''}</td>",
+            f"<td style='{cell}{accent}'>{html.escape(str(r['名称']))}</td>",
+            f"<td style='{cell}font-weight:600'>{html.escape(str(r['代码']))}{' 🔗' if cross else ''}</td>",
         ]
         for b in broker_cols:
             v = int(round(float(r[b]))) if pd.notna(r[b]) else 0
@@ -269,8 +270,8 @@ def send_by_broker_summary_email(
     返回 True 表示已发送；无可展示数据返回 False（不发空邮件）。
     异常向上抛出，由调用方决定是否容错。
     """
-    html = build_by_broker_summary_html(results, trade_date=trade_date)
-    if html is None:
+    html_body = build_by_broker_summary_html(results, trade_date=trade_date)
+    if html_body is None:
         return False
     total_cross = sum(
         int((_per_stock_view(r["holdings_by_broker"])[0]["来源券商数"] > 1).sum())
@@ -280,7 +281,7 @@ def send_by_broker_summary_email(
         and not getattr(r.get("holdings_by_broker"), "empty", True)
     )
     subject = f"【组合持仓·分券商汇总】{trade_date.isoformat()}（跨券商 {total_cross} 行）"
-    send_html_email(smtp_config, subject=subject, html_body=html, to_addrs=to_addrs)
+    send_html_email(smtp_config, subject=subject, html_body=html_body, to_addrs=to_addrs)
     return True
 
 
