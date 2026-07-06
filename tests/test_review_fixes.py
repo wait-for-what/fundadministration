@@ -134,14 +134,14 @@ def test_client_isolation_each_email_only_own_holdings():
 
 def test_client_unit_nav_gate_flags_missing():
     from fundadmin.portfolio.cross_broker_report import PRODUCT_CONFIG
-    from fundadmin.portfolio.operations import _client_unit_nav_missing
+    from fundadmin.portfolio.reports import client_unit_nav_missing
 
     names = [c["name"] for c in PRODUCT_CONFIG]
     results = [
         {"product_name": names[0], "unit_nav": 1.2, "asset_nav": 1.3},
         {"product_name": names[1], "unit_nav": None, "asset_nav": 1.4},
     ]
-    miss = _client_unit_nav_missing(results)
+    miss = client_unit_nav_missing(results)
     assert names[1] in miss and names[0] not in miss
 
 

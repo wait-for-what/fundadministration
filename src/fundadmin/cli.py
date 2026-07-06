@@ -35,7 +35,7 @@ def portfolio(ctx: typer.Context) -> None:
     子命令：email-sync / sync-latest / build-products / build-cross-broker /
     prune-inbox / notify-clients。用 `portfolio --help` 查看 argparse 帮助。
     """
-    from fundadmin.portfolio.operations import main as ops_main
+    from fundadmin.portfolio.cli import main as ops_main
 
     raise typer.Exit(code=int(ops_main(list(ctx.args))))
 
