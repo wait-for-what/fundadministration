@@ -496,6 +496,7 @@ def main(argv: list[str] | None = None) -> int:
     parser_email_sync.add_argument("--trade-date", required=True, help="YYYY-MM-DD or latest")
     parser_email_sync.add_argument("--out-dir", default="", help="Output dir for downloaded attachments.")
     parser_email_sync.add_argument("--imap-host", default="", help="Override IMAP_HOST.")
+    parser_email_sync.add_argument("--imap-user", default="", help="Override IMAP_USER.  不安全：明文口令会泄露到进程表/历史，优先用 .env。")
     parser_email_sync.add_argument("--imap-port", default=0, type=int, help="Override IMAP_PORT.")
     parser_email_sync.add_argument("--imap-pass", default="", help="Override IMAP_PASS. 不安全：明文口令会泄露到进程表/历史，优先用 .env。")
     parser_email_sync.add_argument("--imap-mailbox", default="", help="Override IMAP_MAILBOX.")
