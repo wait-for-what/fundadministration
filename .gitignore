@@ -16,3 +16,5 @@ dist/
 .pytest_cache/
 .ruff_cache/
 研报素材CTA/
+
+.reasonix/

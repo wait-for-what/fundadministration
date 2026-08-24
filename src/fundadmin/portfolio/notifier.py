@@ -107,7 +107,7 @@ def build_email_html(
     if exclude:
         exclude_note = f"<p style='color:#888;font-size:12px;'>注：{', '.join(sorted(exclude))} 的持仓明细未在邮件中展示。</p>"
 
-    html = f"""<!DOCTYPE html>
+    html_body = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -151,7 +151,7 @@ td {{ padding: 8px 12px; border: 1px solid #ddd; }}
 </div>
 </body>
 </html>"""
-    return html
+    return html_body
 
 
 def _build_single_product_html(
@@ -434,7 +434,7 @@ def build_weight_matrix_html(
                 f"</div>"
             )
 
-    html = f"""<!DOCTYPE html>
+    html_body = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -456,7 +456,7 @@ h2 {{ font-size: 18px; color: #1a1a1a; border-bottom: 2px solid #4a90d9; padding
 </div>
 </body>
 </html>"""
-    return html
+    return html_body
 
 
 def send_matrix_email(
