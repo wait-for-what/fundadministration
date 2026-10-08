@@ -1,5 +1,3 @@
-"""客户净值等派生计算。"""
+"""客户派生计算（预留包；product_nav_history 下线后暂无导出）。"""
 
-from .client_nav import build_client_nav_frame
-
-__all__ = ["build_client_nav_frame"]
+__all__: list[str] = []

@@ -1,9 +1,8 @@
-"""客户/净值/持仓 CLI 子命令。
+"""客户/持仓 CLI 子命令。
 
 调用入口:
 - python -m fundadmin.cli clients init-db
 - python -m fundadmin.cli clients import-clients --csv PATH
-- python -m fundadmin.cli clients import-nav --xlsx PATH [--as-of DATE]
 - python -m fundadmin.cli clients import-portfolio --xlsx PATH [--as-of DATE]
 
 输出:
@@ -42,20 +41,6 @@ def cli_import_clients(
 
     rows = import_clients_csv(csv)
     typer.echo(f"clients: upserted {rows} rows")
-
-
-@clients_app.command("import-nav")
-def cli_import_nav(
-    xlsx: Path = typer.Option(
-        ..., "--xlsx", help="fund_portfolio_summary_<date>.xlsx 路径", exists=True, dir_okay=False
-    ),
-    as_of: str | None = typer.Option(None, "--as-of", help="估值日；缺省按文件名推断或当天"),
-) -> None:
-    """导入产品净值。"""
-    from fundadmin.clients.ingest.client_nav import import_nav_xlsx
-
-    rows = import_nav_xlsx(xlsx, as_of_date=as_of)
-    typer.echo(f"product_nav_history: upserted {rows} rows")
 
 
 @clients_app.command("import-portfolio")

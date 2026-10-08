@@ -1,7 +1,7 @@
 """SQLite 表结构定义与初始化。
 
 用途:
-- 维护本地表：fund_portfolio_holdings / clients / product_nav_history（原有 3 张），
+- 维护本地表：fund_portfolio_holdings / clients（原有），
   以及附件入库两层结构 attachment_ingest / raw_sheet_rows（原始无损落地层）、
   fund_positions / product_valuation（核心结构层）。
 - 不使用任何 MySQL 方言（无 ENGINE / utf8mb4 / ON UPDATE CURRENT_TIMESTAMP / AUTO_INCREMENT）。
@@ -22,7 +22,7 @@ from fundadmin.db.engine import get_engine as _create_engine
 
 from .config import resolve_db_url
 
-# 3 张表 + 2 个索引。每条语句独立可重复执行。
+# 全部表 + 索引。每条语句独立可重复执行。
 _DDL_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS fund_portfolio_holdings (
@@ -56,17 +56,6 @@ _DDL_STATEMENTS: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS ix_clients_email ON clients(email)",
-    """
-    CREATE TABLE IF NOT EXISTS product_nav_history (
-        prodcode    TEXT NOT NULL,
-        as_of_date  TEXT NOT NULL,
-        nav_unit    REAL NOT NULL,
-        nav_cum     REAL,
-        src_xlsx    TEXT,
-        loaded_at   TEXT NOT NULL DEFAULT (datetime('now')),
-        PRIMARY KEY (prodcode, as_of_date)
-    )
-    """,
     # ---- Layer 1：原始无损落地层 ----
     # 每个入库附件一行；sha256 为内容去重唯一键，相同内容（即便文件名不同）只入库一次。
     """
@@ -160,7 +149,7 @@ _DDL_STATEMENTS: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS ix_tx_product_date ON fund_transactions(product_code, trade_date)",
     "CREATE INDEX IF NOT EXISTS ix_tx_ticker ON fund_transactions(product_code, ticker, trade_date)",
-    # 产品级净值/规模（与 product_nav_history 互补，含市值/资产净值）。
+    # 产品级净值/规模（含市值/资产净值）。
     """
     CREATE TABLE IF NOT EXISTS product_valuation (
         as_of_date              TEXT NOT NULL,

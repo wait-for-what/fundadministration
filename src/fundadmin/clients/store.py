@@ -53,7 +53,6 @@ _CLIENTS_COLS: tuple[str, ...] = (
     "mobile",
     "active",
 )
-_NAV_COLS: tuple[str, ...] = ("prodcode", "as_of_date", "nav_unit", "nav_cum", "src_xlsx")
 _ATTACHMENT_COLS: tuple[str, ...] = (
     "sha256",
     "file_name",
@@ -220,13 +219,6 @@ def upsert_clients(df: pd.DataFrame, *, engine: Engine | None = None) -> int:
     payload = _normalize(df, _CLIENTS_COLS, defaults={"active": 1})
     payload["active"] = pd.to_numeric(payload["active"], errors="coerce").fillna(1).astype(int)
     return _upsert(eng, "clients", _CLIENTS_COLS, ("custname", "prodcode"), payload)
-
-
-def upsert_nav(df: pd.DataFrame, *, engine: Engine | None = None) -> int:
-    """写入产品净值。主键 (prodcode, as_of_date)。"""
-    eng = engine or get_engine()
-    payload = _normalize(df, _NAV_COLS)
-    return _upsert(eng, "product_nav_history", _NAV_COLS, ("prodcode", "as_of_date"), payload)
 
 
 # ---------------------------------------------------------------------------
@@ -509,37 +501,6 @@ def load_clients(*, active_only: bool = True, engine: Engine | None = None) -> p
     return pd.read_sql(text(sql), eng)
 
 
-def load_latest_nav(engine: Engine | None = None) -> pd.DataFrame:
-    """每个 prodcode 取最大 as_of_date 的一条净值。"""
-    eng = engine or get_engine()
-    sql = text(
-        """
-        SELECT n.*
-        FROM product_nav_history n
-        JOIN (
-            SELECT prodcode, MAX(as_of_date) AS max_d FROM product_nav_history GROUP BY prodcode
-        ) t ON n.prodcode = t.prodcode AND n.as_of_date = t.max_d
-        ORDER BY n.prodcode
-        """
-    )
-    return pd.read_sql(sql, eng)
-
-
-def load_nav_asof(as_of_date: str, *, engine: Engine | None = None) -> pd.DataFrame:
-    """指定估值日的所有产品净值。"""
-    eng = engine or get_engine()
-    sql = text("SELECT * FROM product_nav_history WHERE as_of_date = :d ORDER BY prodcode")
-    return pd.read_sql(sql, eng, params={"d": as_of_date})
-
-
-def list_nav_dates(engine: Engine | None = None) -> list[str]:
-    """所有净值估值日（倒序）。"""
-    eng = engine or get_engine()
-    sql = text("SELECT DISTINCT as_of_date FROM product_nav_history ORDER BY as_of_date DESC")
-    with eng.connect() as conn:
-        return [row[0] for row in conn.execute(sql).fetchall()]
-
-
 def load_positions(
     *,
     product_code: str | None = None,
@@ -652,7 +613,6 @@ def load_raw_sheet_rows(ingest_id: int, *, engine: Engine | None = None) -> pd.D
 __all__ = [
     "upsert_holdings",
     "upsert_clients",
-    "upsert_nav",
     "insert_attachment",
     "insert_attachment_with_rows",
     "upsert_raw_sheet_rows",
@@ -665,9 +625,6 @@ __all__ = [
     "list_holdings_dates",
     "list_holdings_products",
     "load_clients",
-    "load_latest_nav",
-    "load_nav_asof",
-    "list_nav_dates",
     "load_positions",
     "list_position_products",
     "list_position_dates",

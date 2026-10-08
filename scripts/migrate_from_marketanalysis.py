@@ -1,9 +1,10 @@
-"""一次性数据迁移：旧 internal_dashboard SQLite 的 3 张基金表 -> 新仓 FUND_DB_URL。
+"""一次性数据迁移：旧 internal_dashboard SQLite 的基金表 -> 新仓 FUND_DB_URL。
 
 用途:
 - 剥离切换时，把 MarketAnalysis 时期 internal_dashboard SQLite（INTERNAL_DB_URL）里的
-  clients / product_nav_history / fund_portfolio_holdings 三张表，复制到 FundAdministration
+  clients / fund_portfolio_holdings 两张表，复制到 FundAdministration
   的 FUND_DB_URL（默认独立 SQLite）。幂等：按主键 upsert，可重复执行。
+- product_nav_history 已下线，不再迁移。
 
 输入:
 - --source: 源 SQLite 路径或 SQLAlchemy URL；缺省读 SOURCE_DB_URL / INTERNAL_DB_URL。
@@ -31,7 +32,7 @@ from sqlalchemy import create_engine, text
 from fundadmin.clients import store
 from fundadmin.clients.schema import init_db
 
-_TABLES: tuple[str, ...] = ("clients", "product_nav_history", "fund_portfolio_holdings")
+_TABLES: tuple[str, ...] = ("clients", "fund_portfolio_holdings")
 
 
 def _source_engine(source: str):
@@ -61,7 +62,6 @@ def main() -> int:
 
     upserts = {
         "clients": store.upsert_clients,
-        "product_nav_history": store.upsert_nav,
         "fund_portfolio_holdings": store.upsert_holdings,
     }
     for table in _TABLES:
