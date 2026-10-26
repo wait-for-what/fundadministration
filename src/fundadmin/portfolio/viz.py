@@ -177,3 +177,97 @@ def _generate_empty_chart(product_name: str, trade_date: date, out_path: Path) -
     ax.axis("off")
     fig.savefig(out_path, bbox_inches="tight", facecolor="white")
     plt.close(fig)
+
+
+def generate_adjusted_nav_chart(
+    nav_df: pd.DataFrame,
+    *,
+    product_code: str,
+    product_name: str,
+    events: pd.DataFrame | None = None,
+    out_path: Path,
+) -> Path:
+    """绘制单只产品的净值走势对比：未复权 / 算术加回 / 分红再投资。
+
+    输入:
+        nav_df: 含 val_date, unit_nav, adj_nav（算术加回）, reinvest_nav（分红再投资）
+            的 DataFrame，可由 adjusted_nav.build_nav_variants 得到。
+        product_code / product_name: 用于标题与文件名。
+        events: detect_dividend_events 的输出；在除息日画竖线并标注每份分红。
+        out_path: PNG 输出路径。
+
+    输出:
+        PNG 文件路径。
+    """
+    if nav_df is None or nav_df.empty:
+        _generate_empty_chart(product_name, date.today(), out_path)
+        return out_path
+
+    work = nav_df.sort_values("val_date")
+    x = work["val_date"]
+    raw = work["unit_nav"].astype(float)
+    adj = work["adj_nav"].astype(float)
+    rei = work["reinvest_nav"].astype(float) if "reinvest_nav" in work else None
+
+    fig, ax = plt.subplots(figsize=(13, 5.5), dpi=150)
+
+    if rei is not None:
+        ax.plot(x, rei, color="#1f77b4", linewidth=1.9, label="分红再投资（推荐口径）")
+        ax.plot(x, adj, color="#2ca02c", linewidth=1.1, linestyle="-.",
+                label="算术加回（累计净值）")
+    else:
+        ax.plot(x, adj, color="#1f77b4", linewidth=1.9, label="复权净值（后复权）")
+    ax.plot(x, raw, color="#ff7f0e", linewidth=1.1, linestyle="--", label="单位净值（未复权）")
+
+    n_events = 0
+    if events is not None and not events.empty:
+        hits = events[events["product_code"] == product_code].sort_values("val_date")
+        nav_by_date = work.set_index("val_date")["unit_nav"]
+        for row in hits.itertuples():
+            ax.axvline(row.val_date, color="#d62728", linewidth=0.8, alpha=0.45, linestyle=":")
+            level = nav_by_date.get(row.val_date)
+            if level is not None and pd.notna(level):
+                ax.annotate(
+                    f"-{row.amount_per_unit:g}",
+                    xy=(row.val_date, float(level)),
+                    fontsize=7,
+                    color="#d62728",
+                    rotation=90,
+                    ha="right",
+                    va="top",
+                )
+            n_events += 1
+
+    last = work.iloc[-1]
+    base = work.iloc[0]
+    def _ret(series):
+        s = series.astype(float)
+        return float(s.iloc[-1] / s.iloc[0] - 1.0)
+
+    raw_ret = _ret(raw)
+    adj_ret = _ret(adj)
+    rei_ret = _ret(rei) if rei is not None else None
+    cum_div = float(work["cum_payout"].max()) if "cum_payout" in work else 0.0
+
+    ax.set_title(f"{product_name}（{product_code}）净值走势 · 复权口径对比", fontsize=14, fontweight="bold")
+    parts = [
+        f"{pd.Timestamp(base['val_date']).date()} ~ {pd.Timestamp(last['val_date']).date()}",
+        f"未复权 {raw_ret:+.2%}",
+        f"算术加回 {adj_ret:+.2%}",
+    ]
+    if rei_ret is not None:
+        parts.insert(2, f"分红再投资 {rei_ret:+.2%}")
+    parts.append(f"累计每份分红 {cum_div:.4f}")
+    parts.append(f"分红 {n_events} 次")
+    fig.text(0.5, 0.90, " | ".join(parts), ha="center", fontsize=9, color="#666666")
+
+    ax.set_ylabel("净值（元）")
+    ax.grid(alpha=0.25, linewidth=0.6)
+    ax.legend(loc="upper left", fontsize=9)
+    fig.autofmt_xdate()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.savefig(out_path, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return out_path

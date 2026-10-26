@@ -32,6 +32,10 @@ python -m fundadmin.cli projectx init-db
 python -m fundadmin.cli projectx sync
 python -m fundadmin.cli projectx verify
 
+# 沐泽1号每日持仓变动（只发 muze 分组；--dry-run 只构建不发送）
+python -m fundadmin.cli portfolio notify-muze --dry-run
+python -m fundadmin.cli portfolio notify-muze --trade-date 2026-10-19 --force
+
 # 内网看板（产品持仓 / 客户净值）
 streamlit run app/streamlit_app.py
 ```

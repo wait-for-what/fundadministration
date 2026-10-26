@@ -22,6 +22,10 @@ from fundadmin.portfolio.cross_broker_report import CrossBrokerInput, build_cros
 from fundadmin.portfolio.email_filters import build_imap_search_criteria
 from fundadmin.portfolio.maintenance import format_bytes, prune_inbox
 from fundadmin.portfolio.client_notifier import send_client_nav_emails
+from fundadmin.portfolio.muze_notifier import (
+    smtp_config_from_env,
+    send_muze_daily_change_email,
+)
 from fundadmin.portfolio.operations import (
     DEFAULT_SYNC_LOOKBACK,
     PUBLISH_SCAN_DAYS,
@@ -331,11 +335,34 @@ def _cmd_sync_latest(args: argparse.Namespace) -> int:
                     clients_sent += 1
             _save_publish_state(publish_state_path, publish_state)
 
+    muze_sent = 0
+    if bool(getattr(args, "notify_muze", False)):
+        try:
+            mres = send_muze_daily_change_email(
+                inbox_dir=inbox_root,
+                group=str(getattr(args, "email_group", "muze") or "muze"),
+                force=bool(getattr(args, "republish", False)),
+            )
+        except Exception:
+            logger.exception("muze daily change email failed")
+            print("[WARN] 沐泽1号持仓变动邮件发送失败（不影响数据同步）")
+        else:
+            if mres.get("sent"):
+                muze_sent = 1
+                print(
+                    f"[OK] 沐泽1号持仓变动邮件已发送: {mres.get('trade_date')} -> "
+                    f"{', '.join(mres.get('recipients') or [])} "
+                    f"({mres.get('n_changes')} 条变动)"
+                )
+            else:
+                print(f"[SKIP] 沐泽1号持仓变动邮件: {mres.get('reason')}")
+
     print(
         f"[OK] sync-latest finished: received_dates={len(resolved_dates)}, "
         f"download_failures={download_failures}, "
         f"saved_attachments={total_saved}, skipped_messages={total_skipped}, "
-        f"built_reports={built_reports}, matrix_sent={matrix_sent}, clients_sent={clients_sent}"
+        f"built_reports={built_reports}, matrix_sent={matrix_sent}, clients_sent={clients_sent}, "
+        f"muze_sent={muze_sent}"
     )
     if state_file is not None:
         print(f"state_file: {state_file}")
@@ -437,6 +464,65 @@ def _cmd_notify_clients(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_notify_muze(args: argparse.Namespace) -> int:
+    """向 default 分组发送沐泽1号最新估值日的持仓变动邮件。"""
+    inbox_dir = (
+        Path(args.inbox_dir).expanduser()
+        if str(getattr(args, "inbox_dir", "") or "").strip()
+        else _default_inbox_root()
+    )
+    if not inbox_dir.exists():
+        print(f"[ERROR] inbox dir not found: {inbox_dir}")
+        return 1
+
+    smtp = None
+    if not args.dry_run:
+        try:
+            smtp = smtp_config_from_env(
+                host=str(args.smtp_host or ""),
+                port=int(args.smtp_port or 0),
+                user=str(args.smtp_user or ""),
+                password=str(args.smtp_pass or ""),
+                from_addr=str(args.smtp_from or ""),
+            )
+        except RuntimeError as exc:
+            print(f"[ERROR] {exc}")
+            return 1
+
+    raw_date = str(args.trade_date or "").strip()
+    result = send_muze_daily_change_email(
+        inbox_dir=inbox_dir,
+        group=str(args.group or "muze"),
+        trade_date=None if raw_date.lower() in ("", "latest") else raw_date,
+        smtp_config=smtp,
+        state_file=str(args.state_file or "").strip() or None,
+        force=bool(args.force),
+        dry_run=bool(args.dry_run),
+    )
+
+    if result.get("html") and str(args.out_html or "").strip():
+        out_html = Path(args.out_html).expanduser()
+        out_html.parent.mkdir(parents=True, exist_ok=True)
+        out_html.write_text(result["html"], encoding="utf-8")
+        print(f"[OK] HTML 已写出: {out_html}")
+
+    if result.get("sent"):
+        print(
+            f"[OK] 沐泽1号持仓变动邮件已发送: {result['trade_date']} -> "
+            f"{', '.join(result['recipients'])} ({result['n_changes']} 条变动)"
+        )
+        return 0
+    if result.get("reason") == "dry_run":
+        print(
+            f"[DRY-RUN] 报告日 {result['trade_date']}, {result['n_changes']} 条变动, "
+            f"收件人 {result['recipients']}"
+        )
+        return 0
+    print(f"[SKIP] 未发送: {result.get('reason')} "
+          f"({result.get('trade_date', '')})")
+    return 0
+
+
 def _cmd_reconcile(args: argparse.Namespace) -> int:
     load_env()
     from fundadmin.clients.config import NAME_TO_PRODCODE
@@ -532,6 +618,8 @@ def main(argv: list[str] | None = None) -> int:
     parser_sync.add_argument("--notify-clients", action="store_true", default=False, help="Send client NAV notification emails after each successful, data-complete build.")
     parser_sync.add_argument("--email-to", default="", help="Comma-separated matrix-email recipients (or set EMAIL_TO env var).")
     parser_sync.add_argument("--republish", action="store_true", default=False, help="Ignore published-state and resend matrix/client emails for in-window trade dates (manual re-send).")
+    parser_sync.add_argument("--notify-muze", action="store_true", default=False, help="Send 沐泽1号 daily holdings-change email to the default group after syncing.")
+    parser_sync.add_argument("--email-group", default="muze", help="Recipient group for --notify-muze (default: muze).")
     parser_sync.set_defaults(func=_cmd_sync_latest)
 
     parser_build = sub.add_parser("build", help="Compatibility alias of build-products. Prefer build-products.")
@@ -594,6 +682,24 @@ def main(argv: list[str] | None = None) -> int:
     parser_nc.add_argument("--smtp-pass", default="", help="Override SMTP_PASS. 不安全：明文口令会泄露到进程表/历史，优先用 .env。")
     parser_nc.add_argument("--smtp-from", default="", help="Override EMAIL_FROM.")
     parser_nc.set_defaults(func=_cmd_notify_clients)
+
+    parser_mz = sub.add_parser(
+        "notify-muze",
+        help="向 default 分组发送沐泽1号最新估值日的持仓变动邮件。",
+    )
+    parser_mz.add_argument("--inbox-dir", default="", help="估值表根目录；默认为 outputs/excels/fund_inbox。")
+    parser_mz.add_argument("--trade-date", default="", help="指定估值日 YYYY-MM-DD；默认最新估值日。")
+    parser_mz.add_argument("--group", default="muze", help="收件人分组，默认 muze（EMAIL_GROUP_MUZE）。")
+    parser_mz.add_argument("--smtp-host", default="", help="Override SMTP_HOST.")
+    parser_mz.add_argument("--smtp-port", default=0, type=int, help="Override SMTP_PORT.")
+    parser_mz.add_argument("--smtp-user", default="", help="Override SMTP_USER.")
+    parser_mz.add_argument("--smtp-pass", default="", help="Override SMTP_PASS. 不安全：明文口令会泄露到进程表/历史，优先用 .env。")
+    parser_mz.add_argument("--smtp-from", default="", help="Override EMAIL_FROM.")
+    parser_mz.add_argument("--state-file", default="", help="已发送状态文件；默认 outputs/state/muze_notify_state.json。")
+    parser_mz.add_argument("--force", action="store_true", default=False, help="忽略已发送状态，强制重发。")
+    parser_mz.add_argument("--dry-run", action="store_true", default=False, help="只构建并打印，不发送。")
+    parser_mz.add_argument("--out-html", default="", help="可选：把邮件 HTML 写出到文件（调试用）。")
+    parser_mz.set_defaults(func=_cmd_notify_muze)
 
     parser_rec = sub.add_parser(
         "reconcile",

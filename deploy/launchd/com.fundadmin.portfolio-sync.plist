@@ -19,6 +19,7 @@
         <string>/Users/admin/fundadmin/FundAdministration/scripts/run_portfolio_sync.sh</string>
         <string>--with-email</string>
         <string>--notify-clients</string>
+        <string>--notify-muze</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/admin/fundadmin/FundAdministration</string>
