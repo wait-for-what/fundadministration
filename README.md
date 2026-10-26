@@ -27,7 +27,12 @@ python -m fundadmin.cli clients import-portfolio --xlsx path/to/holdings.xlsx
 python -m fundadmin.cli portfolio email-sync
 python -m fundadmin.cli portfolio notify-client-nav --dry-run
 
-# 内网看板（产品持仓）
+# 发布到 projectx MySQL（基金持仓/产品净值，详见 docs/projectx_sync.md）
+python -m fundadmin.cli projectx init-db
+python -m fundadmin.cli projectx sync
+python -m fundadmin.cli projectx verify
+
+# 内网看板（产品持仓 / 客户净值）
 streamlit run app/streamlit_app.py
 ```
 
@@ -40,6 +45,7 @@ src/fundadmin/
   notifications/  # email.py（SMTP）
   clients/        # 客户/持仓：schema / store / ingest / pages（产品净值以 product_valuation 为准，旧 product_nav_history 已下线）
   portfolio/      # 券商持仓 Excel 抓取解析 + 客户净值通知 + 按公司汇总
+  projectx/       # 持仓/净值镜像发布到 projectx MySQL（schema / sync / cli）
 app/              # Streamlit 看板
 deploy/launchd/   # Mac mini 定时任务 + cloudflared 示例
 ```
